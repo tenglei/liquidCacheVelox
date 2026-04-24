@@ -1,0 +1,186 @@
+tenglei@LAPTOP-NU0GSDGG:~/abseil-cpp/build$ ls /opt/absl-static/lib/libabsl_*.a | wc -l
+# 期望输出：>0，通常 60+ 个
+65
+tenglei@LAPTOP-NU0GSDGG:~/abseil-cpp/build$ cd ~/code/liquid-cache-cpp/build
+rm -rf *
+cmake .. -DCMAKE_BUILD_TYPE=Release -DABSL_STATIC_PREFIX=/opt/absl-static
+cmake --build . -j$(nproc)
+-- The CXX compiler identification is GNU 13.3.0
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Success
+-- Found Threads: TRUE
+-- Checking for modules 'libbrotlicommon;libbrotlienc;libbrotlidec'
+--   Found libbrotlicommon, version 1.1.0
+--   Found libbrotlienc, version 1.1.0
+--   Found libbrotlidec, version 1.1.0
+-- Found BrotliAlt: /usr/lib/x86_64-linux-gnu/libbrotlicommon.so
+-- Found OpenSSL: /usr/lib/x86_64-linux-gnu/libcrypto.so (found version "3.0.13")
+-- Could NOT find protobuf (missing: protobuf_DIR)
+-- Found Protobuf: /usr/lib/x86_64-linux-gnu/libprotobuf.so (found version "3.21.12")
+-- Found ZLIB: /usr/lib/x86_64-linux-gnu/libz.so (found version "1.3")
+CMake Warning at /usr/lib/x86_64-linux-gnu/cmake/Arrow/Findlz4Alt.cmake:29 (find_package):
+  By not providing "Findlz4.cmake" in CMAKE_MODULE_PATH this project has
+  asked CMake to find a package configuration file provided by "lz4", but
+  CMake did not find one.
+
+  Could not find a package configuration file provided by "lz4" with any of
+  the following names:
+
+    lz4Config.cmake
+    lz4-config.cmake
+
+  Add the installation prefix of "lz4" to CMAKE_PREFIX_PATH or set "lz4_DIR"
+  to a directory containing one of the above files.  If "lz4" provides a
+  separate development package or SDK, be sure it has been installed.
+Call Stack (most recent call first):
+  /usr/share/cmake-3.28/Modules/CMakeFindDependencyMacro.cmake:76 (find_package)
+  /usr/lib/x86_64-linux-gnu/cmake/Arrow/ArrowConfig.cmake:111 (find_dependency)
+  /usr/lib/x86_64-linux-gnu/cmake/Arrow/ArrowConfig.cmake:134 (arrow_find_dependencies)
+  CMakeLists.txt:15 (find_package)
+
+
+-- Checking for module 'liblz4'
+--   Found liblz4, version 1.9.4
+-- Found lz4Alt: /usr/lib/x86_64-linux-gnu/liblz4.so
+CMake Warning at /usr/lib/x86_64-linux-gnu/cmake/Arrow/Findre2Alt.cmake:29 (find_package):
+  By not providing "Findre2.cmake" in CMAKE_MODULE_PATH this project has
+  asked CMake to find a package configuration file provided by "re2", but
+  CMake did not find one.
+
+  Could not find a package configuration file provided by "re2" with any of
+  the following names:
+
+    re2Config.cmake
+    re2-config.cmake
+
+  Add the installation prefix of "re2" to CMAKE_PREFIX_PATH or set "re2_DIR"
+  to a directory containing one of the above files.  If "re2" provides a
+  separate development package or SDK, be sure it has been installed.
+Call Stack (most recent call first):
+  /usr/share/cmake-3.28/Modules/CMakeFindDependencyMacro.cmake:76 (find_package)
+  /usr/lib/x86_64-linux-gnu/cmake/Arrow/ArrowConfig.cmake:111 (find_dependency)
+  /usr/lib/x86_64-linux-gnu/cmake/Arrow/ArrowConfig.cmake:134 (arrow_find_dependencies)
+  CMakeLists.txt:15 (find_package)
+
+
+-- Checking for module 're2'
+--   Found re2, version 10.0.0
+-- Found re2Alt: /usr/lib/x86_64-linux-gnu/libre2.so
+-- Found BZip2: /usr/lib/x86_64-linux-gnu/libbz2.so (found version "1.0.8")
+-- Looking for BZ2_bzCompressInit
+-- Looking for BZ2_bzCompressInit - found
+-- Found utf8proc: /usr/lib/x86_64-linux-gnu/libutf8proc.so (found version "2.9.0")
+-- Found abslAlt: 1 (found version "20220623")
+-- Found nlohmann_json: /usr/share/cmake/nlohmann_json/nlohmann_jsonConfig.cmake (found version "3.11.3")
+-- Found CURL: /usr/lib/x86_64-linux-gnu/libcurl.so (found version "8.5.0")
+-- Arrow version: 24.0.0
+-- Found the Arrow shared library: /usr/lib/x86_64-linux-gnu/libarrow.so.2400.0.0
+-- Found the Arrow import library: ARROW_IMPORT_LIB-NOTFOUND
+-- Found the Arrow static library: /usr/lib/x86_64-linux-gnu/libarrow.a
+CMake Warning at /usr/lib/x86_64-linux-gnu/cmake/Parquet/FindThriftAlt.cmake:42 (find_package):
+  By not providing "FindThrift.cmake" in CMAKE_MODULE_PATH this project has
+  asked CMake to find a package configuration file provided by "Thrift", but
+  CMake did not find one.
+
+  Could not find a package configuration file provided by "Thrift" with any
+  of the following names:
+
+    ThriftConfig.cmake
+    thrift-config.cmake
+
+  Add the installation prefix of "Thrift" to CMAKE_PREFIX_PATH or set
+  "Thrift_DIR" to a directory containing one of the above files.  If "Thrift"
+  provides a separate development package or SDK, be sure it has been
+  installed.
+Call Stack (most recent call first):
+  /usr/share/cmake-3.28/Modules/CMakeFindDependencyMacro.cmake:76 (find_package)
+  /usr/lib/x86_64-linux-gnu/cmake/Arrow/ArrowConfig.cmake:111 (find_dependency)
+  /usr/lib/x86_64-linux-gnu/cmake/Parquet/ParquetConfig.cmake:72 (arrow_find_dependencies)
+  CMakeLists.txt:17 (find_package)
+
+
+-- Checking for module 'thrift'
+--   Found thrift, version 0.19.0
+-- Found ThriftAlt: /usr/lib/x86_64-linux-gnu/libthrift.so (found version "0.19.0")
+-- Parquet version: 24.0.0
+-- Found the Parquet shared library: /usr/lib/x86_64-linux-gnu/libparquet.so.2400.0.0
+-- Found the Parquet import library: PARQUET_IMPORT_LIB-NOTFOUND
+-- Found the Parquet static library: /usr/lib/x86_64-linux-gnu/libparquet.a
+-- Found JNI: /usr/lib/jvm/default-java/include  found components: AWT JVM
+-- Arrow   .a : /usr/lib/x86_64-linux-gnu/libarrow.a
+-- Parquet .a : /usr/lib/x86_64-linux-gnu/libparquet.a
+-- Bundled .a : /usr/lib/x86_64-linux-gnu/libarrow_bundled_dependencies.a
+-- Found 63 absl .so libraries
+-- Configuring done (13.0s)
+-- Generating done (0.0s)
+CMake Warning:
+  Manually-specified variables were not used by the project:
+
+    ABSL_STATIC_PREFIX
+
+
+-- Build files have been written to: /home/tenglei/code/liquid-cache-cpp/build
+[ 16%] Building CXX object CMakeFiles/liquid_cache_core.dir/src/transcoder_arrow.cpp.o
+[ 33%] Linking CXX static library libliquid_cache_core.a
+[ 33%] Built target liquid_cache_core
+[ 50%] Building CXX object CMakeFiles/liquid_cache_jni.dir/src/jni_bridge.cpp.o
+[ 66%] Building CXX object CMakeFiles/liquid_cache_example.dir/examples/transcode_example.cpp.o
+/home/tenglei/code/liquid-cache-cpp/src/jni_bridge.cpp: In function ‘std::shared_ptr<liquid_cache::jni::ScanResult> {anonymous}::execute_parquet_scan(const std::string&, const std::vector<std::__cxx11::basic_string<char> >&, int)’:
+/home/tenglei/code/liquid-cache-cpp/src/jni_bridge.cpp:91:42: warning: ‘arrow::Status parquet::arrow::FileReader::GetRecordBatchReader(std::shared_ptr<arrow::RecordBatchReader>*)’ is deprecated: Deprecated in 21.0.0. Use arrow::Result version instead. [-Wdeprecated-declarations]
+   91 |         st = reader->GetRecordBatchReader(&batch_reader);
+      |              ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~
+In file included from /home/tenglei/code/liquid-cache-cpp/src/jni_bridge.cpp:22:
+/usr/include/parquet/arrow/reader.h:220:19: note: declared here
+  220 |   ::arrow::Status GetRecordBatchReader(std::shared_ptr<::arrow::RecordBatchReader>* out);
+      |                   ^~~~~~~~~~~~~~~~~~~~
+/home/tenglei/code/liquid-cache-cpp/src/jni_bridge.cpp:93:42: warning: ‘arrow::Status parquet::arrow::FileReader::GetRecordBatchReader(const std::vector<int>&, std::shared_ptr<arrow::RecordBatchReader>*)’ is deprecated: Deprecated in 21.0.0. Use arrow::Result version instead. [-Wdeprecated-declarations]
+   93 |         st = reader->GetRecordBatchReader(column_indices, &batch_reader);
+      |              ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/usr/include/parquet/arrow/reader.h:215:19: note: declared here
+  215 |   ::arrow::Status GetRecordBatchReader(const std::vector<int>& row_group_indices,
+      |                   ^~~~~~~~~~~~~~~~~~~~
+/home/tenglei/code/liquid-cache-cpp/examples/transcode_example.cpp: In function ‘void process_parquet_file(const std::string&, TranscodeStats&)’:
+/home/tenglei/code/liquid-cache-cpp/examples/transcode_example.cpp:225:43: warning: ‘arrow::Status parquet::arrow::FileReader::GetRecordBatchReader(std::shared_ptr<arrow::RecordBatchReader>*)’ is deprecated: Deprecated in 21.0.0. Use arrow::Result version instead. [-Wdeprecated-declarations]
+  225 |     auto st = reader->GetRecordBatchReader(&batch_reader);
+      |               ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~
+In file included from /home/tenglei/code/liquid-cache-cpp/examples/transcode_example.cpp:36:
+/usr/include/parquet/arrow/reader.h:220:19: note: declared here
+  220 |   ::arrow::Status GetRecordBatchReader(std::shared_ptr<::arrow::RecordBatchReader>* out);
+      |                   ^~~~~~~~~~~~~~~~~~~~
+/home/tenglei/code/liquid-cache-cpp/examples/transcode_example.cpp: In function ‘IterResult read_all_parquet_once(const std::vector<std::__cxx11::basic_string<char> >&)’:
+/home/tenglei/code/liquid-cache-cpp/examples/transcode_example.cpp:528:47: warning: ‘arrow::Status parquet::arrow::FileReader::GetRecordBatchReader(std::shared_ptr<arrow::RecordBatchReader>*)’ is deprecated: Deprecated in 21.0.0. Use arrow::Result version instead. [-Wdeprecated-declarations]
+  528 |         auto st = reader->GetRecordBatchReader(&batch_reader);
+      |                   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~
+/usr/include/parquet/arrow/reader.h:220:19: note: declared here
+  220 |   ::arrow::Status GetRecordBatchReader(std::shared_ptr<::arrow::RecordBatchReader>* out);
+      |                   ^~~~~~~~~~~~~~~~~~~~
+/home/tenglei/code/liquid-cache-cpp/examples/transcode_example.cpp: In function ‘std::vector<LiquidCacheFile> convert_to_liquid(const std::vector<std::__cxx11::basic_string<char> >&, double&)’:
+/home/tenglei/code/liquid-cache-cpp/examples/transcode_example.cpp:619:47: warning: ‘arrow::Status parquet::arrow::FileReader::GetRecordBatchReader(std::shared_ptr<arrow::RecordBatchReader>*)’ is deprecated: Deprecated in 21.0.0. Use arrow::Result version instead. [-Wdeprecated-declarations]
+  619 |         auto st = reader->GetRecordBatchReader(&batch_reader);
+      |                   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~
+/usr/include/parquet/arrow/reader.h:220:19: note: declared here
+  220 |   ::arrow::Status GetRecordBatchReader(std::shared_ptr<::arrow::RecordBatchReader>* out);
+      |                   ^~~~~~~~~~~~~~~~~~~~
+[ 83%] Linking CXX shared library liquid_cache_jni.so
+[100%] Linking CXX executable liquid_cache_example
+[100%] Built target liquid_cache_jni
+[100%] Built target liquid_cache_example
+tenglei@LAPTOP-NU0GSDGG:~/code/liquid-cache-cpp/build$ ldd liquid_cache_example | grep -E "arrow|parquet|absl"
+# 期望：完全无输出
+        libabsl_bad_optional_access.so.20220623 => /lib/x86_64-linux-gnu/libabsl_bad_optional_access.so.20220623 (0x00007d166909b000)
+        libabsl_bad_variant_access.so.20220623 => /lib/x86_64-linux-gnu/libabsl_bad_variant_access.so.20220623 (0x00007d1669096000)
+        libabsl_str_format_internal.so.20220623 => /lib/x86_64-linux-gnu/libabsl_str_format_internal.so.20220623 (0x00007d166907c000)
+        libabsl_strings.so.20220623 => /lib/x86_64-linux-gnu/libabsl_strings.so.20220623 (0x00007d166905d000)
+        libabsl_strings_internal.so.20220623 => /lib/x86_64-linux-gnu/libabsl_strings_internal.so.20220623 (0x00007d1669057000)
+        libabsl_throw_delegate.so.20220623 => /lib/x86_64-linux-gnu/libabsl_throw_delegate.so.20220623 (0x00007d166904e000)
+        libabsl_time.so.20220623 => /lib/x86_64-linux-gnu/libabsl_time.so.20220623 (0x00007d166903c000)
+        libabsl_time_zone.so.20220623 => /lib/x86_64-linux-gnu/libabsl_time_zone.so.20220623 (0x00007d1669022000)
+        libabsl_int128.so.20220623 => /lib/x86_64-linux-gnu/libabsl_int128.so.20220623 (0x00007d1666916000)
+        libabsl_raw_logging_internal.so.20220623 => /lib/x86_64-linux-gnu/libabsl_raw_logging_internal.so.20220623 (0x00007d1666313000)
+        libabsl_base.so.20220623 => /lib/x86_64-linux-gnu/libabsl_base.so.20220623 (0x00007d166630d000)
+        libabsl_spinlock_wait.so.20220623 => /lib/x86_64-linux-gnu/libabsl_spinlock_wait.so.20220623 (0x00007d1665e7f000)
