@@ -28,6 +28,14 @@
 #include <vector>
 
 #include "liquid_cache/liquid_array.h"
+#include "liquid_cache/lru_policy.h"
+
+#ifdef LIQUID_ENABLE_VELOX
+namespace facebook::velox {
+class RowType;
+using RowTypePtr = std::shared_ptr<const RowType>;
+}  // namespace facebook::velox
+#endif
 
 namespace liquid_cache {
 
@@ -74,6 +82,21 @@ struct LiquidCacheKeyHash {
         return std::hash<uint64_t>{}(k.to_u64());
     }
 };
+
+}  // namespace liquid_cache
+
+// std::hash specialization for LiquidCacheKey — needed by LruPolicy
+// (which uses std::unordered_map<LiquidCacheKey, ...> internally).
+namespace std {
+template <>
+struct hash<liquid_cache::LiquidCacheKey> {
+    size_t operator()(const liquid_cache::LiquidCacheKey& k) const noexcept {
+        return hash<uint64_t>{}(k.to_u64());
+    }
+};
+}  // namespace std
+
+namespace liquid_cache {
 
 // ═══════════════════════════════════════════════════════════════════════
 // CacheEntryType and CacheEntry
@@ -155,7 +178,8 @@ struct CacheEntry {
 // Equivalent to Rust's LiquidCache struct from src/core/src/cache/core.rs,
 // simplified to:
 //   - In-memory only (no disk tier, no squeeze)
-//   - No eviction policy (unbounded)
+//   - LRU eviction with configurable memory budget
+//   - Memory budget via atomic lock-free accounting
 //   - Thread-safe via std::mutex
 //   - Column projection via projection indices
 //   - Row filtering via BooleanArray mask
@@ -165,20 +189,88 @@ class LiquidCacheStore {
 public:
     LiquidCacheStore() = default;
 
+    /// Create a cache store with a memory budget limit.
+    /// @param max_cache_bytes Maximum memory in bytes (0 = unlimited, default).
+    explicit LiquidCacheStore(size_t max_cache_bytes)
+        : max_cache_bytes_(max_cache_bytes)
+        , budget_(max_cache_bytes) {}
+
+    /// Set the maximum cache memory budget.
+    /// Setting to 0 disables the budget (unlimited).
+    /// Does NOT evict existing entries — only affects future insertions.
+    void set_max_cache_bytes(size_t max_bytes) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        max_cache_bytes_ = max_bytes;
+        budget_.set_max_bytes(max_bytes);
+    }
+
+    /// Current memory budget usage in bytes.
+    size_t memory_budget_usage() const {
+        return budget_.usage();
+    }
+
+    /// Maximum cache memory budget in bytes (0 = unlimited).
+    size_t max_cache_bytes() const {
+        return max_cache_bytes_;
+    }
+
     // ── Insert operations ────────────────────────────────────────────
 
     /// Insert a Liquid-encoded array into the cache.
-    /// Mirrors Rust: cache.insert(entry_id, array).await
-    void insert(const LiquidCacheKey& key, LiquidArrayRef array) {
+    /// If the memory budget is exceeded, evicts LRU entries to make room.
+    /// @return true if inserted successfully, false if entry too large for budget.
+    bool insert(const LiquidCacheKey& key, LiquidArrayRef array) {
         std::lock_guard<std::mutex> lock(mutex_);
-        entries_[key] = CacheEntry::from_liquid(std::move(array));
+        auto entry = CacheEntry::from_liquid(std::move(array));
+        size_t entry_size = entry.memory_size();
+
+        auto existing = entries_.find(key);
+        if (existing != entries_.end()) {
+            // Update: evict if growing, then update budget
+            size_t old_size = existing->second.memory_size();
+            if (entry_size > old_size) {
+                if (!make_budget_space(entry_size - old_size, lock)) return false;
+            }
+            if (!budget_.try_update(old_size, entry_size)) return false;
+            entries_[key] = std::move(entry);
+        } else {
+            // New entry: first evict if needed, then reserve
+            if (!make_budget_space(entry_size, lock)) return false;
+            if (!budget_.try_reserve(entry_size)) return false;
+            entries_[key] = std::move(entry);
+        }
+
+        lru_.notify_insert(key);
+        return true;
     }
 
-    /// Insert a raw Arrow array into the cache (MemoryArrow entry).
-    void insert_arrow(const LiquidCacheKey& key,
+    /// Insert a raw Arrow array into the cache.
+    /// If the memory budget is exceeded, evicts LRU entries to make room.
+    /// @return true if inserted successfully, false if entry too large for budget.
+    bool insert_arrow(const LiquidCacheKey& key,
                       std::shared_ptr<arrow::Array> array) {
         std::lock_guard<std::mutex> lock(mutex_);
-        entries_[key] = CacheEntry::from_arrow(std::move(array));
+        auto entry = CacheEntry::from_arrow(std::move(array));
+        size_t entry_size = entry.memory_size();
+
+        auto existing = entries_.find(key);
+        if (existing != entries_.end()) {
+            // Update: evict if growing, then update budget
+            size_t old_size = existing->second.memory_size();
+            if (entry_size > old_size) {
+                if (!make_budget_space(entry_size - old_size, lock)) return false;
+            }
+            if (!budget_.try_update(old_size, entry_size)) return false;
+            entries_[key] = std::move(entry);
+        } else {
+            // New entry: first evict if needed, then reserve
+            if (!make_budget_space(entry_size, lock)) return false;
+            if (!budget_.try_reserve(entry_size)) return false;
+            entries_[key] = std::move(entry);
+        }
+
+        lru_.notify_insert(key);
+        return true;
     }
 
     // ── Single-entry read ────────────────────────────────────────────
@@ -193,9 +285,13 @@ public:
     /// Mirrors Rust: cache.get(&entry_id).with_selection(filter).read().await
     std::shared_ptr<arrow::Array> get(
             const LiquidCacheKey& key,
-            const std::shared_ptr<arrow::BooleanArray>& selection = nullptr) const {
+            const std::shared_ptr<arrow::BooleanArray>& selection = nullptr) {
         std::lock_guard<std::mutex> lock(mutex_);
-        return get_unlocked(key, selection);
+        auto result = get_unlocked(key, selection);
+        if (result) {
+            lru_.notify_access(key);
+        }
+        return result;
     }
 
     // ── Batch read with column projection and row filtering ──────────
@@ -293,6 +389,8 @@ public:
         size_t total_memory_bytes = 0;
         size_t liquid_entries = 0;
         size_t arrow_entries = 0;
+        size_t budget_usage_bytes = 0;
+        size_t budget_max_bytes = 0;
     };
 
     Stats stats() const {
@@ -304,6 +402,8 @@ public:
             if (entry.type == CacheEntryType::MemoryLiquid) ++s.liquid_entries;
             else ++s.arrow_entries;
         }
+        s.budget_usage_bytes = budget_.usage();
+        s.budget_max_bytes = budget_.max_bytes();
         return s;
     }
 
@@ -324,7 +424,48 @@ public:
     void clear() {
         std::lock_guard<std::mutex> lock(mutex_);
         entries_.clear();
+        budget_.reset();
+        lru_.clear();
     }
+
+    /// Number of entries tracked by the LRU policy.
+    size_t lru_size() const {
+        return lru_.size();
+    }
+
+#ifdef LIQUID_ENABLE_VELOX
+    // ── Velox Vector read operations ─────────────────────────────────
+
+    /// Load Parquet files and return Velox RowType (no Arrow types exposed).
+    /// Internally calls load_from_parquet() with transcode_to_liquid_array
+    /// and converts the Arrow Schema to Velox RowType.
+    std::vector<RowGroupInfo> load_from_parquet_for_velox(
+            const std::vector<std::string>& files,
+            facebook::velox::RowTypePtr& veloxRowType,
+            double& transcode_sec);
+
+    /// Read a single cached column as a Velox Vector.
+    facebook::velox::VectorPtr read_column_velox(
+            const LiquidCacheKey& key,
+            facebook::velox::memory::MemoryPool* pool) const;
+
+    /// Read multiple columns as a Velox RowVector.
+    ///
+    /// @param file_id     File identifier
+    /// @param rg_id       Row group identifier
+    /// @param batch_id    Batch identifier within row group
+    /// @param rowType     Velox RowType describing the full table schema
+    /// @param pool        Velox memory pool for allocations
+    /// @param projection  Column indices to read (empty = all columns)
+    /// @return RowVector with projected columns, or nullptr
+    facebook::velox::VectorPtr read_batch_velox(
+            uint16_t file_id,
+            uint16_t rg_id,
+            uint16_t batch_id,
+            const facebook::velox::RowTypePtr& rowType,
+            facebook::velox::memory::MemoryPool* pool,
+            const std::vector<int>& projection = {}) const;
+#endif  // LIQUID_ENABLE_VELOX
 
 private:
     /// Get without locking (caller must hold mutex_).
@@ -336,8 +477,50 @@ private:
         return it->second.read(selection);
     }
 
+    /// Ensure enough budget for a new entry of `needed_bytes`.
+    /// Evicts LRU entries if necessary. Caller must hold mutex_.
+    /// @param needed_bytes Size of the entry to be inserted.
+    /// @param lock Reference to lock_guard (proof lock is held).
+    /// @return true if budget was reserved, false if entry exceeds total budget.
+    /// Evict LRU entries until enough space is freed for `needed_bytes`.
+    /// Does NOT reserve the budget — the caller must call try_reserve() after.
+    /// Caller must hold mutex_.
+    /// @param needed_bytes Space needed in bytes.
+    /// @param lock Reference to lock_guard.
+    /// @return true if enough space was freed or already available.
+    bool make_budget_space(size_t needed_bytes,
+                           const std::lock_guard<std::mutex>& /*lock*/) {
+        if (max_cache_bytes_ == 0) return true;
+        if (needed_bytes > max_cache_bytes_) return false;
+
+        // Evict until budget_.usage() + needed_bytes <= max_cache_bytes_
+        const size_t max_attempts = 1024;
+        for (size_t attempt = 0; attempt < max_attempts; ++attempt) {
+            size_t used = budget_.usage();
+            if (used + needed_bytes <= max_cache_bytes_) return true;
+
+            auto victims = lru_.find_victims(8);
+            if (victims.empty()) break;
+
+            for (const auto& victim : victims) {
+                auto it = entries_.find(victim);
+                if (it != entries_.end()) {
+                    size_t freed = it->second.memory_size();
+                    entries_.erase(it);
+                    budget_.release(freed);
+                    if (budget_.usage() + needed_bytes <= max_cache_bytes_)
+                        return true;
+                }
+            }
+        }
+        return budget_.usage() + needed_bytes <= max_cache_bytes_;
+    }
+
     mutable std::mutex mutex_;
     std::unordered_map<LiquidCacheKey, CacheEntry, LiquidCacheKeyHash> entries_;
+    size_t max_cache_bytes_ = 0;
+    MemoryBudget budget_;
+    mutable LruPolicy<LiquidCacheKey> lru_;
 };
 
 }  // namespace liquid_cache

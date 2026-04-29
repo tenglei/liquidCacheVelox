@@ -35,13 +35,18 @@ public:
 
     /// Train the symbol table from input data.
     /// Uses a greedy bigram/trigram counting approach (simplified vs. full FSST paper).
+    /// For large inputs, only samples the first 1MB for speed.
     void train(const uint8_t* data, size_t len) {
         symbol_count_ = 0;
         if (len == 0) return;
 
+        // Sample data for large inputs to avoid O(n) hash map overhead
+        static constexpr size_t kMaxTrainBytes = 1 << 20;  // 1MB sample
+        size_t train_len = std::min(len, kMaxTrainBytes);
+
         // Count bigrams (2-byte sequences) - main compression opportunity
         std::unordered_map<uint16_t, uint32_t> bigram_counts;
-        for (size_t i = 0; i + 1 < len; ++i) {
+        for (size_t i = 0; i + 1 < train_len; ++i) {
             uint16_t bg = static_cast<uint16_t>(data[i]) |
                           (static_cast<uint16_t>(data[i + 1]) << 8);
             bigram_counts[bg]++;
@@ -49,7 +54,7 @@ public:
 
         // Also count trigrams for better compression
         std::unordered_map<uint32_t, uint32_t> trigram_counts;
-        for (size_t i = 0; i + 2 < len; ++i) {
+        for (size_t i = 0; i + 2 < train_len; ++i) {
             uint32_t tg = static_cast<uint32_t>(data[i]) |
                           (static_cast<uint32_t>(data[i + 1]) << 8) |
                           (static_cast<uint32_t>(data[i + 2]) << 16);
@@ -102,20 +107,30 @@ public:
             std::memcpy(symbols_[symbol_count_].bytes, c.bytes, 8);
             ++symbol_count_;
         }
+
+        // Build first-byte lookup table for fast compression
+        build_lookup_table();
     }
 
     /// Compress input data using the trained symbol table.
+    /// Uses a first-byte lookup table for O(1) symbol narrowing per position.
     std::vector<uint8_t> compress(const uint8_t* input, size_t input_len) const {
         std::vector<uint8_t> output;
         output.reserve(input_len);
 
         size_t i = 0;
         while (i < input_len) {
-            // Try to match the longest symbol
+            // Use first-byte lookup table to narrow candidates
             int best_sym = -1;
             uint8_t best_len = 0;
+            uint8_t first_byte = input[i];
 
-            for (uint8_t s = 0; s < symbol_count_; ++s) {
+            // Check all symbols that start with this byte
+            uint8_t start = first_byte_idx_[first_byte];
+            uint8_t end = (first_byte < 255) ? first_byte_idx_[first_byte + 1]
+                                             : symbol_count_;
+            for (uint8_t idx = start; idx < end; ++idx) {
+                uint8_t s = first_byte_syms_[idx];
                 uint8_t slen = symbols_[s].len;
                 if (slen > best_len && i + slen <= input_len) {
                     if (std::memcmp(input + i, symbols_[s].bytes, slen) == 0) {
@@ -205,6 +220,8 @@ public:
             std::memcpy(comp.symbols_[i].bytes, &sym, 8);
             offset += 8;
         }
+
+        comp.build_lookup_table();
         return comp;
     }
 
@@ -216,6 +233,37 @@ public:
 private:
     FsstSymbol symbols_[255];
     uint8_t symbol_count_ = 0;
+
+    // First-byte lookup table: maps first byte → indices in first_byte_syms_
+    // first_byte_idx_[b] = start index, first_byte_idx_[b+1] = end index
+    uint8_t first_byte_idx_[256];
+    // Contiguous array of symbol indices grouped by their first byte
+    uint8_t first_byte_syms_[255];
+
+    /// Build first-byte lookup table for fast compression.
+    /// Groups symbols by their first byte so compress() can narrow candidates.
+    void build_lookup_table() {
+        // Count symbols per first byte
+        uint8_t counts[256] = {};
+        for (uint8_t s = 0; s < symbol_count_; ++s) {
+            counts[symbols_[s].bytes[0]]++;
+        }
+
+        // Build prefix-sum index (256 entries, where idx[b]..idx[b+1] is the
+        // range of symbols starting with byte b)
+        first_byte_idx_[0] = 0;
+        for (int b = 0; b < 255; ++b) {
+            first_byte_idx_[b + 1] = first_byte_idx_[b] + counts[b];
+        }
+
+        // Fill symbol indices grouped by first byte
+        uint8_t pos[256] = {};
+        std::memcpy(pos, first_byte_idx_, 256);
+        for (uint8_t s = 0; s < symbol_count_; ++s) {
+            uint8_t fb = symbols_[s].bytes[0];
+            first_byte_syms_[pos[fb]++] = s;
+        }
+    }
 };
 
 }  // namespace liquid_cache

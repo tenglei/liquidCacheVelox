@@ -70,130 +70,238 @@ class LiquidDecimalArray {
 public:
     LiquidDecimalArray() = default;
 
-    /// Check if all non-null values in a Decimal128Array fit in uint64_t.
+    /// Check if all non-null values in a Decimal128/256Array fit in uint64_t.
     static bool fits_u64(const std::shared_ptr<arrow::Array>& array) {
-        auto dec_arr = std::static_pointer_cast<arrow::Decimal128Array>(array);
-        for (int64_t i = 0; i < dec_arr->length(); ++i) {
-            if (dec_arr->IsNull(i)) continue;
-            arrow::Decimal128 val(dec_arr->Value(i));
-            // Fits in u64 iff non-negative and high bits are zero
-            if (val < arrow::Decimal128(0) || val.high_bits() != 0) {
-                return false;
+        if (array->type_id() == arrow::Type::DECIMAL128) {
+            auto dec_arr = std::static_pointer_cast<arrow::Decimal128Array>(array);
+            for (int64_t i = 0; i < dec_arr->length(); ++i) {
+                if (dec_arr->IsNull(i)) continue;
+                arrow::Decimal128 val(dec_arr->Value(i));
+                // Fits in u64 iff non-negative and high bits are zero
+                if (val < arrow::Decimal128(0) || val.high_bits() != 0) {
+                    return false;
+                }
             }
+            return true;
+        } else if (array->type_id() == arrow::Type::DECIMAL256) {
+            auto dec_arr = std::static_pointer_cast<arrow::Decimal256Array>(array);
+            for (int64_t i = 0; i < dec_arr->length(); ++i) {
+                if (dec_arr->IsNull(i)) continue;
+                // Decimal256 fits in u64 only if bytes 8..31 are all zero
+                // and the low 8 bytes represent a non-negative value
+                const uint8_t* raw = dec_arr->Value(i);
+                bool high_zero = true;
+                for (int b = 8; b < 32; ++b) {
+                    if (raw[b] != 0) { high_zero = false; break; }
+                }
+                if (!high_zero) return false;
+                // Check sign: if any high byte is non-zero, value doesn't fit in u64
+                // (already checked above). Low 8 bytes are the unsigned value.
+            }
+            return true;
         }
-        return true;
+        return false;
     }
 
-    /// Encode from Arrow Decimal128Array (only call if fits_u64() is true).
+    /// Encode from Arrow Decimal128/256Array (only call if fits_u64() is true).
     static LiquidDecimalArray from_arrow(
             const std::shared_ptr<arrow::Array>& array) {
         LiquidDecimalArray result;
-        auto dec_arr = std::static_pointer_cast<arrow::Decimal128Array>(array);
-        auto dec_type = std::static_pointer_cast<arrow::Decimal128Type>(array->type());
 
-        result.arrow_type_ = 0;  // Decimal128
-        result.precision_ = static_cast<uint8_t>(dec_type->precision());
-        result.scale_ = static_cast<int8_t>(dec_type->scale());
+        int64_t len = array->length();
 
-        int64_t len = dec_arr->length();
+        if (array->type_id() == arrow::Type::DECIMAL128) {
+            auto dec_arr = std::static_pointer_cast<arrow::Decimal128Array>(array);
+            auto dec_type = std::static_pointer_cast<arrow::Decimal128Type>(array->type());
+            result.arrow_type_ = 0;  // Decimal128
+            result.precision_ = static_cast<uint8_t>(dec_type->precision());
+            result.scale_ = static_cast<int8_t>(dec_type->scale());
 
-        // Handle all-null array
-        if (dec_arr->null_count() == len) {
-            result.reference_value_ = 0;
-            std::vector<uint64_t> zeros(len, 0);
+            if (dec_arr->null_count() == len) {
+                result.reference_value_ = 0;
+                std::vector<uint64_t> zeros(len, 0);
+                const uint8_t* null_bitmap = nullptr;
+                std::vector<uint8_t> null_bits;
+                if (dec_arr->null_bitmap()) {
+                    size_t bitmap_bytes = (len + 7) / 8;
+                    null_bits.assign(dec_arr->null_bitmap()->data(),
+                                     dec_arr->null_bitmap()->data() + bitmap_bytes);
+                    null_bitmap = null_bits.data();
+                }
+                result.bit_packed_ = BitPackedArray(
+                    zeros.data(), null_bitmap, static_cast<uint32_t>(len), 0);
+                return result;
+            }
+
+            std::vector<uint64_t> values(len);
+            uint64_t min_val = UINT64_MAX;
+            uint64_t max_val = 0;
+
+            for (int64_t i = 0; i < len; ++i) {
+                if (dec_arr->IsNull(i)) {
+                    values[i] = 0;
+                    continue;
+                }
+                arrow::Decimal128 val(dec_arr->Value(i));
+                uint64_t u64_val = val.low_bits();
+                values[i] = u64_val;
+                if (u64_val < min_val) min_val = u64_val;
+                if (u64_val > max_val) max_val = u64_val;
+            }
+
+            result.reference_value_ = min_val;
+            uint64_t range = max_val - min_val;
+            uint8_t bw = get_bit_width(range);
+
+            std::vector<uint64_t> offsets(len);
+            for (int64_t i = 0; i < len; ++i) {
+                offsets[i] = dec_arr->IsNull(i) ? 0 : values[i] - min_val;
+            }
+
             const uint8_t* null_bitmap = nullptr;
             std::vector<uint8_t> null_bits;
-            if (dec_arr->null_bitmap()) {
+            if (dec_arr->null_count() > 0 && dec_arr->null_bitmap()) {
                 size_t bitmap_bytes = (len + 7) / 8;
                 null_bits.assign(dec_arr->null_bitmap()->data(),
                                  dec_arr->null_bitmap()->data() + bitmap_bytes);
                 null_bitmap = null_bits.data();
             }
+
             result.bit_packed_ = BitPackedArray(
-                zeros.data(), null_bitmap, static_cast<uint32_t>(len), 0);
-            return result;
-        }
+                offsets.data(), null_bitmap, static_cast<uint32_t>(len), bw);
+        } else {
+            // DECIMAL256 (fits-u64 path)
+            auto dec_arr = std::static_pointer_cast<arrow::Decimal256Array>(array);
+            auto dec_type = std::static_pointer_cast<arrow::Decimal256Type>(array->type());
+            result.arrow_type_ = 1;  // Decimal256
+            result.precision_ = static_cast<uint8_t>(dec_type->precision());
+            result.scale_ = static_cast<int8_t>(dec_type->scale());
 
-        // Extract u64 values, find min/max
-        std::vector<uint64_t> values(len);
-        uint64_t min_val = UINT64_MAX;
-        uint64_t max_val = 0;
-
-        for (int64_t i = 0; i < len; ++i) {
-            if (dec_arr->IsNull(i)) {
-                values[i] = 0;
-                continue;
+            if (dec_arr->null_count() == len) {
+                result.reference_value_ = 0;
+                std::vector<uint64_t> zeros(len, 0);
+                const uint8_t* null_bitmap = nullptr;
+                std::vector<uint8_t> null_bits;
+                if (dec_arr->null_bitmap()) {
+                    size_t bitmap_bytes = (len + 7) / 8;
+                    null_bits.assign(dec_arr->null_bitmap()->data(),
+                                     dec_arr->null_bitmap()->data() + bitmap_bytes);
+                    null_bitmap = null_bits.data();
+                }
+                result.bit_packed_ = BitPackedArray(
+                    zeros.data(), null_bitmap, static_cast<uint32_t>(len), 0);
+                return result;
             }
-            arrow::Decimal128 val(dec_arr->Value(i));
-            uint64_t u64_val = val.low_bits();
-            values[i] = u64_val;
-            if (u64_val < min_val) min_val = u64_val;
-            if (u64_val > max_val) max_val = u64_val;
-        }
 
-        result.reference_value_ = min_val;
-        uint64_t range = max_val - min_val;
-        uint8_t bw = get_bit_width(range);
+            std::vector<uint64_t> values(len);
+            uint64_t min_val = UINT64_MAX;
+            uint64_t max_val = 0;
 
-        // Compute offsets (subtract reference)
-        std::vector<uint64_t> offsets(len);
-        for (int64_t i = 0; i < len; ++i) {
-            if (dec_arr->IsNull(i)) {
-                offsets[i] = 0;
-            } else {
-                offsets[i] = values[i] - min_val;
+            for (int64_t i = 0; i < len; ++i) {
+                if (dec_arr->IsNull(i)) {
+                    values[i] = 0;
+                    continue;
+                }
+                // Decimal256 stored as 32 bytes LE; low 8 bytes = u64 value
+                const uint8_t* raw = dec_arr->Value(i);
+                uint64_t u64_val = 0;
+                std::memcpy(&u64_val, raw, 8);
+                values[i] = u64_val;
+                if (u64_val < min_val) min_val = u64_val;
+                if (u64_val > max_val) max_val = u64_val;
             }
-        }
 
-        // Build null bitmap
-        const uint8_t* null_bitmap = nullptr;
-        std::vector<uint8_t> null_bits;
-        if (dec_arr->null_count() > 0 && dec_arr->null_bitmap()) {
-            size_t bitmap_bytes = (len + 7) / 8;
-            null_bits.assign(dec_arr->null_bitmap()->data(),
-                             dec_arr->null_bitmap()->data() + bitmap_bytes);
-            null_bitmap = null_bits.data();
-        }
+            result.reference_value_ = min_val;
+            uint64_t range = max_val - min_val;
+            uint8_t bw = get_bit_width(range);
 
-        result.bit_packed_ = BitPackedArray(
-            offsets.data(), null_bitmap, static_cast<uint32_t>(len), bw);
+            std::vector<uint64_t> offsets(len);
+            for (int64_t i = 0; i < len; ++i) {
+                offsets[i] = dec_arr->IsNull(i) ? 0 : values[i] - min_val;
+            }
+
+            const uint8_t* null_bitmap = nullptr;
+            std::vector<uint8_t> null_bits;
+            if (dec_arr->null_count() > 0 && dec_arr->null_bitmap()) {
+                size_t bitmap_bytes = (len + 7) / 8;
+                null_bits.assign(dec_arr->null_bitmap()->data(),
+                                 dec_arr->null_bitmap()->data() + bitmap_bytes);
+                null_bitmap = null_bits.data();
+            }
+
+            result.bit_packed_ = BitPackedArray(
+                offsets.data(), null_bitmap, static_cast<uint32_t>(len), bw);
+        }
 
         return result;
     }
 
-    /// Decode back to Arrow Decimal128Array.
+    /// Decode back to Arrow Decimal128/256Array.
     /// Optimized: bulk unpack + direct buffer construction.
     std::shared_ptr<arrow::Array> to_arrow() const {
         uint32_t len = bit_packed_.length();
-        auto dec_type = arrow::decimal128(precision_, scale_);
-        if (len == 0) {
-            return arrow::MakeEmptyArray(dec_type).ValueOrDie();
+
+        if (arrow_type_ == 0) {
+            // Decimal128
+            auto dec_type = arrow::decimal128(precision_, scale_);
+            if (len == 0) {
+                return arrow::MakeEmptyArray(dec_type).ValueOrDie();
+            }
+
+            // Allocate Decimal128 buffer (16 bytes per element)
+            int64_t buf_size = static_cast<int64_t>(len) * 16;
+            auto value_buf = arrow::AllocateBuffer(buf_size).ValueOrDie();
+            auto* out = value_buf->mutable_data();
+
+            // Bulk unpack u64 offsets
+            std::vector<uint64_t> temp(len);
+            bit_packed_.bulk_unpack_to(temp.data());
+
+            // Convert u64 -> Decimal128 (little-endian: low=value, high=0)
+            for (uint32_t i = 0; i < len; ++i) {
+                uint64_t val = temp[i] + reference_value_;
+                std::memcpy(out + i * 16, &val, 8);      // low 8 bytes
+                std::memset(out + i * 16 + 8, 0, 8);     // high 8 bytes = 0
+            }
+
+            auto null_buf = bit_packed_.null_bitmap_arrow_buffer();
+            int64_t nc = bit_packed_.null_count();
+            auto data = arrow::ArrayData::Make(
+                dec_type, static_cast<int64_t>(len),
+                {std::move(null_buf), std::move(value_buf)},
+                nc);
+            return arrow::MakeArray(data);
+        } else {
+            // Decimal256
+            auto dec_type = arrow::decimal256(precision_, scale_);
+            if (len == 0) {
+                return arrow::MakeEmptyArray(dec_type).ValueOrDie();
+            }
+
+            // Allocate Decimal256 buffer (32 bytes per element)
+            int64_t buf_size = static_cast<int64_t>(len) * 32;
+            auto value_buf = arrow::AllocateBuffer(buf_size).ValueOrDie();
+            auto* out = value_buf->mutable_data();
+
+            // Bulk unpack u64 offsets
+            std::vector<uint64_t> temp(len);
+            bit_packed_.bulk_unpack_to(temp.data());
+
+            // Convert u64 -> Decimal256 (little-endian: low=value, rest=0)
+            for (uint32_t i = 0; i < len; ++i) {
+                uint64_t val = temp[i] + reference_value_;
+                std::memcpy(out + i * 32, &val, 8);      // low 8 bytes
+                std::memset(out + i * 32 + 8, 0, 24);    // high 24 bytes = 0
+            }
+
+            auto null_buf = bit_packed_.null_bitmap_arrow_buffer();
+            int64_t nc = bit_packed_.null_count();
+            auto data = arrow::ArrayData::Make(
+                dec_type, static_cast<int64_t>(len),
+                {std::move(null_buf), std::move(value_buf)},
+                nc);
+            return arrow::MakeArray(data);
         }
-
-        // Step 1: Allocate Decimal128 buffer (16 bytes per element)
-        int64_t buf_size = static_cast<int64_t>(len) * 16;
-        auto value_buf = arrow::AllocateBuffer(buf_size).ValueOrDie();
-        auto* out = value_buf->mutable_data();
-
-        // Step 2: Bulk unpack u64 offsets
-        std::vector<uint64_t> temp(len);
-        bit_packed_.bulk_unpack_to(temp.data());
-
-        // Step 3: Convert u64 -> Decimal128 (little-endian: low=value, high=0)
-        for (uint32_t i = 0; i < len; ++i) {
-            uint64_t val = temp[i] + reference_value_;
-            std::memcpy(out + i * 16, &val, 8);      // low 8 bytes
-            std::memset(out + i * 16 + 8, 0, 8);     // high 8 bytes = 0
-        }
-
-        // Step 4: Null bitmap + direct construction
-        auto null_buf = bit_packed_.null_bitmap_arrow_buffer();
-        int64_t nc = bit_packed_.null_count();
-        auto data = arrow::ArrayData::Make(
-            dec_type, static_cast<int64_t>(len),
-            {std::move(null_buf), std::move(value_buf)},
-            nc);
-        return arrow::MakeArray(data);
     }
 
     /// Serialize to bytes (binary-compatible with Rust).
@@ -270,6 +378,12 @@ public:
     size_t memory_size() const {
         return bit_packed_.memory_size() + sizeof(uint64_t) + sizeof(*this);
     }
+
+#ifdef LIQUID_ENABLE_VELOX
+    /// Decode directly to Velox FlatVector<int128_t> (LongDecimal).
+    facebook::velox::VectorPtr to_velox(
+        facebook::velox::memory::MemoryPool* pool) const;
+#endif
 
 private:
     static constexpr size_t bit_pack_starting_loc() {

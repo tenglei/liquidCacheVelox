@@ -1,1 +1,9 @@
+*.parquet filter=lfs diff=lfs merge=lfs -text
+build/liquid_velox_benchmark filter=lfs diff=lfs merge=lfs -text
+build/libliquid_cache_jni.so filter=lfs diff=lfs merge=lfs -text
+build/generate_test_parquet filter=lfs diff=lfs merge=lfs -text
+build/verify_parquet filter=lfs diff=lfs merge=lfs -text
+build/liquid_cache_example filter=lfs diff=lfs merge=lfs -text
+build/*.a filter=lfs diff=lfs merge=lfs -text
+build/*.so filter=lfs diff=lfs merge=lfs -text
 build/** filter=lfs diff=lfs merge=lfs -text

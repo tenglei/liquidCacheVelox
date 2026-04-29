@@ -342,3 +342,18 @@ LiquidEncodedArray transcode_float(
 }
 
 }  // namespace liquid_cache
+
+// Forward declarations for Arrow-dependent transcode functions
+// (defined in transcoder_arrow.cpp, require Arrow C++ headers)
+namespace arrow { class Array; }
+namespace liquid_cache {
+
+/// Transcode a single Arrow array column into Liquid Cache format.
+LiquidEncodedArray transcode_arrow_array(
+    const std::shared_ptr<arrow::Array>& array);
+
+/// Decode a Liquid encoded array back to Arrow format.
+std::shared_ptr<arrow::Array> decode_liquid_array(
+    const LiquidEncodedArray& encoded);
+
+}  // namespace liquid_cache

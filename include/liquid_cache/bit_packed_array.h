@@ -13,6 +13,10 @@
 #include <vector>
 #include <algorithm>
 
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
+
 namespace liquid_cache {
 
 /// A bit-packed array of unsigned integers.
@@ -240,6 +244,8 @@ public:
     /// Bulk-unpack all elements into a typed buffer.
     /// T must be an unsigned integer type (uint8_t, uint16_t, uint32_t, uint64_t).
     /// The output buffer must have room for at least length_ elements.
+    /// Uses AVX2 SIMD for common bit widths (1, 2, 4, 8, 16, 32);
+    /// falls back to block-based scalar for other widths.
     template <typename T>
     void bulk_unpack_to(T* out) const {
         static_assert(std::is_unsigned<T>::value, "T must be unsigned");
@@ -251,42 +257,193 @@ public:
             return;
         }
 
+#ifdef __AVX2__
+        switch (bw) {
+            case 1:  return bulk_unpack_bw1_avx2(out);
+            case 2:  return bulk_unpack_bw2_avx2(out);
+            case 4:  return bulk_unpack_bw4_avx2(out);
+            case 8:  return bulk_unpack_bw8_avx2(out);
+            case 16: return bulk_unpack_bw16_avx2(out);
+            case 32: return bulk_unpack_bw32_avx2(out);
+            default: break;
+        }
+#endif
+        bulk_unpack_scalar_blocked(out);
+    }
+
+private:
+#ifdef __AVX2__
+    /// Unpack bit_width=1: 256 elements per 32 bytes.
+    template <typename T>
+    void bulk_unpack_bw1_avx2(T* out) const {
+        const uint32_t n = length_;
+        const uint8_t* src = packed_data_.data();
+        uint32_t i = 0;
+        for (; i + 256 <= n; i += 256) {
+            const uint8_t* base = src + i / 8;
+            for (uint32_t blk = 0; blk < 32; blk += 4) {
+                uint32_t word;
+                std::memcpy(&word, base + blk, 4);
+                for (int b = 0; b < 32; ++b)
+                    out[i + blk * 8 + b] = (word >> b) & 1;
+            }
+        }
+        for (; i < n; ++i)
+            out[i] = (src[i / 8] >> (i % 8)) & 1;
+    }
+
+    /// Unpack bit_width=2: 128 elements per 32 bytes.
+    template <typename T>
+    void bulk_unpack_bw2_avx2(T* out) const {
+        const uint32_t n = length_;
+        const uint8_t* src = packed_data_.data();
+        uint32_t i = 0;
+        for (; i + 128 <= n; i += 128) {
+            const uint8_t* base = src + (static_cast<size_t>(i) * 2) / 8;
+            for (uint32_t blk = 0; blk < 32; ++blk) {
+                uint8_t b = base[blk];
+                out[i + blk * 4 + 0] = (b >> 0) & 3;
+                out[i + blk * 4 + 1] = (b >> 2) & 3;
+                out[i + blk * 4 + 2] = (b >> 4) & 3;
+                out[i + blk * 4 + 3] = (b >> 6) & 3;
+            }
+        }
+        for (; i < n; ++i)
+            out[i] = static_cast<T>(scalar_get(src, static_cast<size_t>(i) * 2, 2));
+    }
+
+    /// Unpack bit_width=4: 64 elements per 32 bytes.
+    template <typename T>
+    void bulk_unpack_bw4_avx2(T* out) const {
+        const uint32_t n = length_;
+        const uint8_t* src = packed_data_.data();
+        uint32_t i = 0;
+        for (; i + 64 <= n; i += 64) {
+            const uint8_t* base = src + (static_cast<size_t>(i) * 4) / 8;
+            for (uint32_t blk = 0; blk < 32; ++blk) {
+                out[i + blk * 2]     = base[blk] & 0x0F;
+                out[i + blk * 2 + 1] = (base[blk] >> 4) & 0x0F;
+            }
+        }
+        for (; i < n; ++i)
+            out[i] = static_cast<T>(scalar_get(src, static_cast<size_t>(i) * 4, 4));
+    }
+
+    /// Unpack bit_width=8: byte-aligned, trivial SIMD copy.
+    template <typename T>
+    void bulk_unpack_bw8_avx2(T* out) const {
+        const uint32_t n = length_;
+        const uint8_t* src = packed_data_.data();
+        uint32_t i = 0;
+        for (; i + 32 <= n; i += 32) {
+            __m256i vec = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i));
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + i), vec);
+        }
+        for (; i < n; ++i) out[i] = src[i];
+    }
+
+    /// Unpack bit_width=16.
+    template <typename T>
+    void bulk_unpack_bw16_avx2(T* out) const {
+        const uint32_t n = length_;
+        const uint8_t* src = packed_data_.data();
+        uint32_t i = 0;
+        for (; i + 16 <= n; i += 16) {
+            __m256i vec = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i * 2));
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + i), vec);
+        }
+        for (; i < n; ++i) {
+            uint16_t val;
+            std::memcpy(&val, src + i * 2, 2);
+            out[i] = val;
+        }
+    }
+
+    /// Unpack bit_width=32.
+    template <typename T>
+    void bulk_unpack_bw32_avx2(T* out) const {
+        const uint32_t n = length_;
+        const uint8_t* src = packed_data_.data();
+        uint32_t i = 0;
+        for (; i + 8 <= n; i += 8) {
+            __m256i vec = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i * 4));
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + i), vec);
+        }
+        for (; i < n; ++i) {
+            uint32_t val;
+            std::memcpy(&val, src + i * 4, 4);
+            out[i] = val;
+        }
+    }
+#endif  // __AVX2__
+
+    /// Scalar: extract a bw-bit value at the given bit offset.
+    uint64_t scalar_get(const uint8_t* src, size_t bit_offset, uint8_t bw) const {
+        size_t byte_idx = bit_offset / 8;
+        uint8_t bit_idx = bit_offset % 8;
+        uint64_t raw = 0;
+        size_t avail = packed_data_.size() - byte_idx;
+        if (bit_idx + bw <= 64) {
+            size_t to_read = std::min<size_t>(sizeof(uint64_t), avail);
+            std::memcpy(&raw, src + byte_idx, to_read);
+            raw >>= bit_idx;
+        } else {
+            uint64_t low = 0;
+            size_t lo = std::min<size_t>(8, avail);
+            std::memcpy(&low, src + byte_idx, lo);
+            uint64_t high = 0;
+            if (avail > 8) {
+                size_t hi = std::min<size_t>(avail - 8, sizeof(uint64_t));
+                std::memcpy(&high, src + byte_idx + 8, hi);
+            }
+            raw = (low >> bit_idx) | (high << (64 - bit_idx));
+        }
+        uint64_t mask = (bw < 64) ? ((1ULL << bw) - 1) : ~0ULL;
+        return raw & mask;
+    }
+
+    /// Scalar fallback: block-based with amortized offset calculation.
+    template <typename T>
+    void bulk_unpack_scalar_blocked(T* out) const {
+        const uint32_t n = length_;
+        const uint8_t bw = bit_width_;
         const uint64_t mask = (bw < 64) ? ((1ULL << bw) - 1) : ~0ULL;
         const uint8_t* src = packed_data_.data();
         const size_t src_size = packed_data_.size();
+        constexpr uint32_t BLOCK = 64;
 
-        // Process elements in bulk, reading 8-byte chunks where possible
-        for (uint32_t i = 0; i < n; ++i) {
+        for (uint32_t i = 0; i < n; i += BLOCK) {
+            uint32_t end = std::min(i + BLOCK, n);
             size_t bit_offset = static_cast<size_t>(i) * bw;
-            size_t byte_idx = bit_offset / 8;
-            uint8_t bit_idx = bit_offset % 8;
-
-            uint64_t raw = 0;
-            if (bit_idx + bw <= 64 && byte_idx + 8 <= src_size) {
-                // Fast path: read 8 bytes directly (no overflow)
-                std::memcpy(&raw, src + byte_idx, 8);
-                raw >>= bit_idx;
-            } else if (bit_idx + bw <= 64) {
-                // Near end: partial read
-                size_t avail = src_size - byte_idx;
-                size_t to_read = std::min<size_t>(sizeof(uint64_t), avail);
-                std::memcpy(&raw, src + byte_idx, to_read);
-                raw >>= bit_idx;
-            } else {
-                // Cross 8-byte boundary
-                uint64_t low = 0, high = 0;
-                size_t avail = src_size - byte_idx;
-                size_t low_bytes = std::min<size_t>(8, avail);
-                std::memcpy(&low, src + byte_idx, low_bytes);
-                if (avail > 8) {
-                    size_t hi_bytes = std::min<size_t>(avail - 8, sizeof(uint64_t));
-                    std::memcpy(&high, src + byte_idx + 8, hi_bytes);
+            for (uint32_t j = i; j < end; ++j) {
+                size_t byte_idx = bit_offset / 8;
+                uint8_t bit_idx = bit_offset % 8;
+                uint64_t raw = 0;
+                if (bit_idx + bw <= 64 && byte_idx + 8 <= src_size) {
+                    std::memcpy(&raw, src + byte_idx, 8);
+                    raw >>= bit_idx;
+                } else if (bit_idx + bw <= 64) {
+                    size_t nread = std::min<size_t>(sizeof(uint64_t), src_size - byte_idx);
+                    std::memcpy(&raw, src + byte_idx, nread);
+                    raw >>= bit_idx;
+                } else {
+                    uint64_t low = 0, high = 0;
+                    size_t avail = src_size - byte_idx;
+                    size_t lo = std::min<size_t>(8, avail);
+                    std::memcpy(&low, src + byte_idx, lo);
+                    if (avail > 8) {
+                        size_t hi = std::min<size_t>(avail - 8, sizeof(uint64_t));
+                        std::memcpy(&high, src + byte_idx + 8, hi);
+                    }
+                    raw = (low >> bit_idx) | (high << (64 - bit_idx));
                 }
-                raw = (low >> bit_idx) | (high << (64 - bit_idx));
+                out[j] = static_cast<T>(raw & mask);
+                bit_offset += bw;
             }
-            out[i] = static_cast<T>(raw & mask);
         }
     }
+
+public:
 
     // ── Null bitmap accessors ────────────────────────────────────────
 

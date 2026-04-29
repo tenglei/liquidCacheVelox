@@ -21,6 +21,7 @@
 #include "liquid_cache/liquid_arrays.h"
 #include "liquid_cache/liquid_byte_view_array.h"
 #include "liquid_cache/liquid_decimal_array.h"
+#include "liquid_cache/liquid_fixed_len_byte_array.h"
 #include "liquid_cache/liquid_array.h"
 #include "liquid_cache/liquid_cache_store.h"
 
@@ -151,6 +152,12 @@ LiquidEncodedArray transcode_arrow_array(const std::shared_ptr<arrow::Array>& ar
         // ── Timestamp types → treat as Int64 with timestamp physical type ──
         case arrow::Type::TIMESTAMP: {
             auto ts_type = std::static_pointer_cast<arrow::TimestampType>(array->type());
+            // Reject timestamps with timezone (matching Rust behavior)
+            if (!ts_type->timezone().empty()) {
+                LiquidEncodedArray result;
+                result.length = static_cast<uint32_t>(array->length());
+                return result;
+            }
             PhysicalType phys;
             switch (ts_type->unit()) {
                 case arrow::TimeUnit::SECOND:      phys = PhysicalType::TimestampSecond; break;
@@ -221,7 +228,74 @@ LiquidEncodedArray transcode_arrow_array(const std::shared_ptr<arrow::Array>& ar
             return result;
         }
 
-        // ── Decimal128: FoR + BitPacking (fits-u64 path) ─────────────
+        // ── StringView / BinaryView: cast to String/Binary first ────
+        case arrow::Type::STRING_VIEW: {
+            auto cast_result = arrow::compute::Cast(array, arrow::utf8());
+            if (!cast_result.ok()) {
+                LiquidEncodedArray result;
+                result.length = static_cast<uint32_t>(array->length());
+                return result;
+            }
+            auto decoded = cast_result.ValueOrDie().make_array();
+            auto liquid = LiquidByteViewArray::from_arrow(decoded);
+            LiquidEncodedArray result;
+            result.logical_type = LiquidDataType::ByteViewArray;
+            result.physical_type = PhysicalType::Int8;
+            result.serialized_bytes = liquid.to_bytes();
+            result.length = liquid.length();
+            result.memory_size = liquid.memory_size();
+            return result;
+        }
+        case arrow::Type::BINARY_VIEW: {
+            auto cast_result = arrow::compute::Cast(array, arrow::binary());
+            if (!cast_result.ok()) {
+                LiquidEncodedArray result;
+                result.length = static_cast<uint32_t>(array->length());
+                return result;
+            }
+            auto decoded = cast_result.ValueOrDie().make_array();
+            auto liquid = LiquidByteViewArray::from_arrow(decoded);
+            LiquidEncodedArray result;
+            result.logical_type = LiquidDataType::ByteViewArray;
+            result.physical_type = PhysicalType::UInt8;
+            result.serialized_bytes = liquid.to_bytes();
+            result.length = liquid.length();
+            result.memory_size = liquid.memory_size();
+            return result;
+        }
+
+        // ── Dictionary types (String/Binary with UInt16 keys) ────────
+        case arrow::Type::DICTIONARY: {
+            auto dict_type = std::static_pointer_cast<arrow::DictionaryType>(array->type());
+            auto value_type_id = dict_type->value_type()->id();
+            // Only support string/binary dictionary types with UInt16 keys
+            if (dict_type->index_type()->id() == arrow::Type::UINT16 &&
+                (value_type_id == arrow::Type::STRING ||
+                 value_type_id == arrow::Type::BINARY ||
+                 value_type_id == arrow::Type::LARGE_STRING ||
+                 value_type_id == arrow::Type::LARGE_BINARY)) {
+                // Decode dictionary to plain array via Cast, then encode as ByteViewArray
+                auto cast_result = arrow::compute::Cast(
+                    array, dict_type->value_type());
+                if (cast_result.ok()) {
+                    auto decoded = cast_result.ValueOrDie().make_array();
+                    auto liquid = LiquidByteViewArray::from_arrow(decoded);
+                    LiquidEncodedArray result;
+                    result.logical_type = LiquidDataType::ByteViewArray;
+                    result.physical_type = PhysicalType::Int8;
+                    result.serialized_bytes = liquid.to_bytes();
+                    result.length = liquid.length();
+                    result.memory_size = liquid.memory_size();
+                    return result;
+                }
+            }
+            // Unsupported dictionary type
+            LiquidEncodedArray result;
+            result.length = static_cast<uint32_t>(array->length());
+            return result;
+        }
+
+        // ── Decimal128: FoR + BitPacking (fits-u64) or FSST Dictionary ──
         case arrow::Type::DECIMAL128: {
             if (LiquidDecimalArray::fits_u64(array)) {
                 auto liquid = LiquidDecimalArray::from_arrow(array);
@@ -233,9 +307,37 @@ LiquidEncodedArray transcode_arrow_array(const std::shared_ptr<arrow::Array>& ar
                 result.memory_size = liquid.memory_size();
                 return result;
             }
-            // Fall through to unsupported for large decimals
+            // Large Decimal128: use Dictionary + FSST compression
+            auto liquid = LiquidFixedLenByteArray::from_decimal128(array);
             LiquidEncodedArray result;
-            result.length = static_cast<uint32_t>(array->length());
+            result.logical_type = LiquidDataType::FixedLenByteArray;
+            result.physical_type = PhysicalType::UInt16;
+            result.serialized_bytes = liquid.to_bytes();
+            result.length = liquid.length();
+            result.memory_size = liquid.memory_size();
+            return result;
+        }
+
+        // ── Decimal256: FoR + BitPacking (fits-u64) or FSST Dictionary ──
+        case arrow::Type::DECIMAL256: {
+            if (LiquidDecimalArray::fits_u64(array)) {
+                auto liquid = LiquidDecimalArray::from_arrow(array);
+                LiquidEncodedArray result;
+                result.logical_type = LiquidDataType::Decimal;
+                result.physical_type = PhysicalType::UInt64;
+                result.serialized_bytes = liquid.to_bytes();
+                result.length = liquid.length();
+                result.memory_size = liquid.memory_size();
+                return result;
+            }
+            // Large Decimal256: use Dictionary + FSST compression
+            auto liquid = LiquidFixedLenByteArray::from_decimal256(array);
+            LiquidEncodedArray result;
+            result.logical_type = LiquidDataType::FixedLenByteArray;
+            result.physical_type = PhysicalType::UInt16;
+            result.serialized_bytes = liquid.to_bytes();
+            result.length = liquid.length();
+            result.memory_size = liquid.memory_size();
             return result;
         }
 
@@ -342,6 +444,33 @@ std::shared_ptr<arrow::Array> decode_liquid_array(const LiquidEncodedArray& enco
         return LiquidByteViewArray::from_bytes(data, len).to_arrow();
     } else if (logical == LiquidDataType::Decimal) {
         return LiquidDecimalArray::from_bytes(data, len).to_arrow();
+    } else if (logical == LiquidDataType::FixedLenByteArray) {
+        return LiquidFixedLenByteArray::from_bytes(data, len).to_arrow();
+    } else if (logical == LiquidDataType::LinearInteger) {
+        switch (physical) {
+            case PhysicalType::Int8:
+                return LiquidLinearIntegerArray<arrow::Int8Type>::from_bytes(data, len).to_arrow();
+            case PhysicalType::Int16:
+                return LiquidLinearIntegerArray<arrow::Int16Type>::from_bytes(data, len).to_arrow();
+            case PhysicalType::Int32:
+                return LiquidLinearIntegerArray<arrow::Int32Type>::from_bytes(data, len).to_arrow();
+            case PhysicalType::Int64:
+                return LiquidLinearIntegerArray<arrow::Int64Type>::from_bytes(data, len).to_arrow();
+            case PhysicalType::UInt8:
+                return LiquidLinearIntegerArray<arrow::UInt8Type>::from_bytes(data, len).to_arrow();
+            case PhysicalType::UInt16:
+                return LiquidLinearIntegerArray<arrow::UInt16Type>::from_bytes(data, len).to_arrow();
+            case PhysicalType::UInt32:
+                return LiquidLinearIntegerArray<arrow::UInt32Type>::from_bytes(data, len).to_arrow();
+            case PhysicalType::UInt64:
+                return LiquidLinearIntegerArray<arrow::UInt64Type>::from_bytes(data, len).to_arrow();
+            case PhysicalType::Date32:
+                return LiquidLinearIntegerArray<arrow::Date32Type>::from_bytes(data, len).to_arrow();
+            case PhysicalType::Date64:
+                return LiquidLinearIntegerArray<arrow::Date64Type>::from_bytes(data, len).to_arrow();
+            default:
+                return nullptr;
+        }
     }
 
     return nullptr;
@@ -412,6 +541,8 @@ LiquidArrayRef transcode_to_liquid_array(
         // ── Timestamp types (stored as Int64, original type preserved) ──
         case arrow::Type::TIMESTAMP: {
             auto ts_type = std::static_pointer_cast<arrow::TimestampType>(orig_type);
+            // Reject timestamps with timezone (matching Rust behavior)
+            if (!ts_type->timezone().empty()) return nullptr;
             PhysicalType phys;
             switch (ts_type->unit()) {
                 case arrow::TimeUnit::SECOND:      phys = PhysicalType::TimestampSecond; break;
@@ -453,6 +584,48 @@ LiquidArrayRef transcode_to_liquid_array(
                 LiquidDataType::ByteViewArray, phys, orig_type);
         }
 
+        // ── StringView / BinaryView: cast to String/Binary first ────
+        case arrow::Type::STRING_VIEW: {
+            auto cast_result = arrow::compute::Cast(array, arrow::utf8());
+            if (!cast_result.ok()) return nullptr;
+            auto decoded = cast_result.ValueOrDie().make_array();
+            return make_liquid_array(
+                LiquidByteViewArray::from_arrow(decoded),
+                LiquidDataType::ByteViewArray, PhysicalType::Int8, orig_type);
+        }
+        case arrow::Type::BINARY_VIEW: {
+            auto cast_result = arrow::compute::Cast(array, arrow::binary());
+            if (!cast_result.ok()) return nullptr;
+            auto decoded = cast_result.ValueOrDie().make_array();
+            return make_liquid_array(
+                LiquidByteViewArray::from_arrow(decoded),
+                LiquidDataType::ByteViewArray, PhysicalType::UInt8, orig_type);
+        }
+
+        // ── Dictionary types (String/Binary with UInt16 keys) ────────
+        case arrow::Type::DICTIONARY: {
+            auto dict_type = std::static_pointer_cast<arrow::DictionaryType>(orig_type);
+            auto value_type_id = dict_type->value_type()->id();
+            if (dict_type->index_type()->id() == arrow::Type::UINT16 &&
+                (value_type_id == arrow::Type::STRING ||
+                 value_type_id == arrow::Type::BINARY ||
+                 value_type_id == arrow::Type::LARGE_STRING ||
+                 value_type_id == arrow::Type::LARGE_BINARY)) {
+                auto cast_result = arrow::compute::Cast(
+                    array, dict_type->value_type());
+                if (cast_result.ok()) {
+                    auto decoded = cast_result.ValueOrDie().make_array();
+                    bool is_binary = (value_type_id == arrow::Type::BINARY ||
+                                      value_type_id == arrow::Type::LARGE_BINARY);
+                    PhysicalType phys = is_binary ? PhysicalType::UInt8 : PhysicalType::Int8;
+                    return make_liquid_array(
+                        LiquidByteViewArray::from_arrow(decoded),
+                        LiquidDataType::ByteViewArray, phys, orig_type);
+                }
+            }
+            return nullptr;
+        }
+
         // ── Decimal128 ──────────────────────────────────────────────
         case arrow::Type::DECIMAL128: {
             if (LiquidDecimalArray::fits_u64(array)) {
@@ -460,7 +633,23 @@ LiquidArrayRef transcode_to_liquid_array(
                     LiquidDecimalArray::from_arrow(array),
                     LiquidDataType::Decimal, PhysicalType::UInt64, orig_type);
             }
-            return nullptr;
+            // Large Decimal128: use Dictionary + FSST compression
+            return make_liquid_array(
+                LiquidFixedLenByteArray::from_decimal128(array),
+                LiquidDataType::FixedLenByteArray, PhysicalType::UInt16, orig_type);
+        }
+
+        // ── Decimal256 ──────────────────────────────────────────────
+        case arrow::Type::DECIMAL256: {
+            if (LiquidDecimalArray::fits_u64(array)) {
+                return make_liquid_array(
+                    LiquidDecimalArray::from_arrow(array),
+                    LiquidDataType::Decimal, PhysicalType::UInt64, orig_type);
+            }
+            // Large Decimal256: use Dictionary + FSST compression
+            return make_liquid_array(
+                LiquidFixedLenByteArray::from_decimal256(array),
+                LiquidDataType::FixedLenByteArray, PhysicalType::UInt16, orig_type);
         }
 
         default:
@@ -488,10 +677,16 @@ std::vector<LiquidCacheStore::RowGroupInfo> LiquidCacheStore::load_from_parquet(
         auto infile = maybe_infile.ValueOrDie();
 
         std::unique_ptr<parquet::arrow::FileReader> reader;
+#if ARROW_VERSION_MAJOR >= 19
         auto open_result = parquet::arrow::OpenFile(
             infile, arrow::default_memory_pool());
         if (!open_result.ok()) { ++file_id; continue; }
         reader = std::move(open_result).ValueOrDie();
+#else
+        auto open_status = parquet::arrow::OpenFile(
+            infile, arrow::default_memory_pool(), &reader);
+        if (!open_status.ok()) { ++file_id; continue; }
+#endif
         reader->set_batch_size(8192);
 
         if (!schema) {
@@ -503,9 +698,14 @@ std::vector<LiquidCacheStore::RowGroupInfo> LiquidCacheStore::load_from_parquet(
         }
 
         std::shared_ptr<arrow::RecordBatchReader> batch_reader;
+#if ARROW_VERSION_MAJOR >= 19
         auto rb_result = reader->GetRecordBatchReader();
         if (!rb_result.ok()) { ++file_id; continue; }
-        batch_reader = rb_result.MoveValueUnsafe();
+        batch_reader = std::move(rb_result).ValueOrDie();
+#else
+        auto rb_status = reader->GetRecordBatchReader(&batch_reader);
+        if (!rb_status.ok()) { ++file_id; continue; }
+#endif
 
         uint16_t rg_id = 0;
         uint16_t batch_id = 0;

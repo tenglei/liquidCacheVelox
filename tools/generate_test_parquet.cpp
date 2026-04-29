@@ -102,7 +102,9 @@ int main(int argc, char* argv[]) {
 
     auto writer_result = parquet::arrow::FileWriter::Open(
         *schema, arrow::default_memory_pool(), outfile,
-        parquet::default_writer_properties(),
+        parquet::WriterProperties::Builder()
+            .compression(arrow::Compression::SNAPPY)
+            ->build(),
         parquet::ArrowWriterProperties::Builder().build());
     if (!writer_result.ok()) {
         std::cerr << "Cannot create writer: " << writer_result.status() << "\n";

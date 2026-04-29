@@ -8,15 +8,27 @@
 #include <arrow/compute/api.h>
 #include <arrow/type_traits.h>
 
+#include <algorithm>
+#include <cstring>
 #include <cmath>
 #include <limits>
 #include <numeric>
+#include <optional>
 #include <stdexcept>
 #include <type_traits>
+#include <unordered_set>
 #include <vector>
 
 #include "liquid_cache/bit_packed_array.h"
 #include "liquid_cache/ipc_header.h"
+
+#ifdef LIQUID_ENABLE_VELOX
+namespace facebook::velox {
+class BaseVector;
+using VectorPtr = std::shared_ptr<BaseVector>;
+namespace memory { class MemoryPool; }
+}  // namespace facebook::velox
+#endif
 
 // Portable Arrow status check: does not depend on ARROW_CHECK_OK macro
 // being available at template definition point (avoids two-phase lookup issues).
@@ -72,6 +84,7 @@ template <> struct ArrowPhysicalType<arrow::UInt32Type> { static constexpr Physi
 template <> struct ArrowPhysicalType<arrow::UInt64Type> { static constexpr PhysicalType value = PhysicalType::UInt64; };
 template <> struct ArrowPhysicalType<arrow::Date32Type> { static constexpr PhysicalType value = PhysicalType::Date32; };
 template <> struct ArrowPhysicalType<arrow::Date64Type> { static constexpr PhysicalType value = PhysicalType::Date64; };
+template <> struct ArrowPhysicalType<arrow::TimestampType> { static constexpr PhysicalType value = PhysicalType::TimestampMicrosecond; };
 
 // ═══════════════════════════════════════════════════════════════════════
 // LiquidPrimitiveArray<T>
@@ -237,6 +250,13 @@ public:
     uint32_t length() const { return bit_packed_.length(); }
     size_t memory_size() const { return bit_packed_.memory_size() + sizeof(*this); }
     uint8_t bit_width() const { return bit_packed_.bit_width(); }
+    const BitPackedArray& bit_packed() const { return bit_packed_; }
+
+#ifdef LIQUID_ENABLE_VELOX
+    /// Decode directly to Velox FlatVector.
+    facebook::velox::VectorPtr to_velox(
+        facebook::velox::memory::MemoryPool* pool) const;
+#endif
 
 private:
     NativeT reference_value_ = 0;
@@ -249,6 +269,326 @@ using LiquidI64Array = LiquidPrimitiveArray<arrow::Int64Type>;
 using LiquidU32Array = LiquidPrimitiveArray<arrow::UInt32Type>;
 using LiquidU64Array = LiquidPrimitiveArray<arrow::UInt64Type>;
 using LiquidDate32Array = LiquidPrimitiveArray<arrow::Date32Type>;
+// ═══════════════════════════════════════════════════════════════════════
+// Helper: saturating i64 prediction helpers
+// ═══════════════════════════════════════════════════════════════════════
+
+inline uint64_t predict_u64_saturated(double pred, uint64_t max_u64) {
+    if (std::isnan(pred) || std::isinf(pred) || pred <= 0.0) return 0;
+    if (pred >= static_cast<double>(max_u64)) return max_u64;
+    return static_cast<uint64_t>(std::llround(pred));
+}
+
+inline int64_t predict_i64_saturated(double pred, int64_t min_i64, int64_t max_i64) {
+    if (std::isnan(pred) || std::isinf(pred)) return 0;
+    if (pred <= static_cast<double>(min_i64)) return min_i64;
+    if (pred >= static_cast<double>(max_i64)) return max_i64;
+    return static_cast<int64_t>(std::llround(pred));
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// L-infinity linear regression helpers
+// ═══════════════════════════════════════════════════════════════════════
+
+inline void range_stats(const std::vector<double>& values,
+                        const std::vector<uint32_t>& idxs,
+                        double m,
+                        double& min_s, uint32_t& i_min,
+                        double& max_s, uint32_t& i_max) {
+    min_s = std::numeric_limits<double>::infinity();
+    max_s = -std::numeric_limits<double>::infinity();
+    for (size_t k = 0; k < values.size(); ++k) {
+        double s = values[k] - m * static_cast<double>(idxs[k]);
+        if (s < min_s) { min_s = s; i_min = idxs[k]; }
+        if (s > max_s) { max_s = s; i_max = idxs[k]; }
+    }
+}
+
+inline std::pair<double, double> fit_linf(
+        const std::vector<double>& values,
+        const std::vector<uint32_t>& idxs) {
+    size_t n = values.size();
+    if (n == 0) return {0.0, 0.0};
+    if (n == 1) return {values[0], 0.0};
+
+    double slope_min = std::numeric_limits<double>::infinity();
+    double slope_max = -std::numeric_limits<double>::infinity();
+    for (size_t k = 1; k < n; ++k) {
+        double di = static_cast<double>(idxs[k] - idxs[k - 1]);
+        if (di > 0.0) {
+            double s = (values[k] - values[k - 1]) / di;
+            if (s < slope_min) slope_min = s;
+            if (s > slope_max) slope_max = s;
+        }
+    }
+    if (!std::isfinite(slope_min) || !std::isfinite(slope_max)) {
+        slope_min = 0.0;
+        slope_max = 0.0;
+    }
+
+    double lo = std::min(slope_min, slope_max);
+    double hi = std::max(slope_min, slope_max);
+    if (std::abs(hi - lo) < 1e-12) {
+        double pad = (std::abs(hi) < 1.0) ? 1.0 : std::abs(hi) * 1e-6;
+        lo -= pad;
+        hi += pad;
+    }
+
+    constexpr int MAX_ITERS = 8;
+    for (int iter = 0; iter < MAX_ITERS; ++iter) {
+        double m = 0.5 * (lo + hi);
+        double min_s, max_s;
+        uint32_t i_min, i_max;
+        range_stats(values, idxs, m, min_s, i_min, max_s, i_max);
+        int64_t g = static_cast<int64_t>(i_min) - static_cast<int64_t>(i_max);
+        if (g > 0) { hi = m; }
+        else if (g < 0) { lo = m; }
+        else { lo = m; hi = m; break; }
+        if (std::abs(hi - lo) < 1e-12) break;
+    }
+
+    double m = 0.5 * (lo + hi);
+    double min_s, max_s;
+    uint32_t i_min_d, i_max_d;
+    range_stats(values, idxs, m, min_s, i_min_d, max_s, i_max_d);
+    double b = 0.5 * (max_s + min_s);
+    return {b, m};
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// LiquidLinearIntegerArray<T>
+//
+// Linear-model integer array: value[i] = intercept + slope*i + residual[i].
+// Residuals are stored as a LiquidPrimitiveArray<Int64Type>.
+// Uses L-infinity (Chebyshev) regression for model fitting.
+// Recommended for monotonic/near-linear sequences only.
+//
+// Serialization (matches Rust):
+//   [LiquidIPCHeader: 16B] (type=LinearInteger, physical=original_type)
+//   [intercept: f64, 8B LE]
+//   [slope:     f64, 8B LE]
+//   [padding to 8B]
+//   [LiquidPrimitiveArray<Int64Type> residuals]
+// ═══════════════════════════════════════════════════════════════════════
+
+template <typename ArrowType>
+class LiquidLinearIntegerArray {
+public:
+    using NativeT = typename ArrowType::c_type;
+    static constexpr bool IS_UNSIGNED = !std::is_signed_v<NativeT>;
+
+    LiquidLinearIntegerArray() = default;
+
+    static LiquidLinearIntegerArray from_arrow(
+            const std::shared_ptr<arrow::Array>& array) {
+        using ArrayT = typename arrow::TypeTraits<ArrowType>::ArrayType;
+        auto typed = std::static_pointer_cast<ArrayT>(array);
+        const int64_t len = typed->length();
+        LiquidLinearIntegerArray result;
+
+        if (typed->null_count() == len) {
+            auto null_arr = arrow::MakeArrayOfNull(arrow::int64(), len).ValueOrDie();
+            result.residuals_ = LiquidPrimitiveArray<arrow::Int64Type>::from_arrow(null_arr);
+            return result;
+        }
+
+        const auto* vals = typed->raw_values();
+        const auto* nulls = typed->null_bitmap_data();
+        int64_t off = typed->offset();
+        size_t nn = static_cast<size_t>(len - typed->null_count());
+        std::vector<double> nn_vals; nn_vals.reserve(nn);
+        std::vector<uint32_t> nn_idxs; nn_idxs.reserve(nn);
+        for (int64_t i = 0; i < len; ++i) {
+            if (!nulls || arrow::bit_util::GetBit(nulls, off + i)) {
+                nn_vals.push_back(static_cast<double>(vals[i]));
+                nn_idxs.push_back(static_cast<uint32_t>(i));
+            }
+        }
+
+        auto [b, m_slope] = fit_linf(nn_vals, nn_idxs);
+        result.intercept_ = b;
+        result.slope_ = m_slope;
+
+        std::vector<int64_t> residuals;
+        residuals.reserve(static_cast<size_t>(len));
+        uint64_t omin_u = UINT64_MAX, omax_u = 0;
+        int64_t omin_i = INT64_MAX, omax_i = INT64_MIN;
+        int64_t rmin = INT64_MAX, rmax = INT64_MIN;
+
+        if constexpr (IS_UNSIGNED) {
+            constexpr uint64_t mx = static_cast<uint64_t>(std::numeric_limits<NativeT>::max());
+            for (int64_t i = 0; i < len; ++i) {
+                bool ok = !nulls || arrow::bit_util::GetBit(nulls, off + i);
+                if (ok) {
+                    uint64_t vu = static_cast<uint64_t>(vals[i]);
+                    if (vu < omin_u) omin_u = vu;
+                    if (vu > omax_u) omax_u = vu;
+                    double pr = m_slope * i + b;
+                    uint64_t p = predict_u64_saturated(pr, mx);
+                    __int128_t d = static_cast<__int128_t>(vu) - static_cast<__int128_t>(p);
+                    int64_t r = (d > INT64_MAX) ? INT64_MAX
+                              : (d < INT64_MIN) ? INT64_MIN : static_cast<int64_t>(d);
+                    if (r < rmin) rmin = r; if (r > rmax) rmax = r;
+                    residuals.push_back(r);
+                } else { residuals.push_back(0); }
+            }
+        } else {
+            constexpr int64_t mi = static_cast<int64_t>(std::numeric_limits<NativeT>::min());
+            constexpr int64_t ma = static_cast<int64_t>(std::numeric_limits<NativeT>::max());
+            for (int64_t i = 0; i < len; ++i) {
+                bool ok = !nulls || arrow::bit_util::GetBit(nulls, off + i);
+                if (ok) {
+                    int64_t vi = static_cast<int64_t>(vals[i]);
+                    if (vi < omin_i) omin_i = vi;
+                    if (vi > omax_i) omax_i = vi;
+                    double pr = m_slope * i + b;
+                    int64_t p = predict_i64_saturated(pr, mi, ma);
+                    __int128_t d = static_cast<__int128_t>(vi) - static_cast<__int128_t>(p);
+                    int64_t r = (d > INT64_MAX) ? INT64_MAX
+                              : (d < INT64_MIN) ? INT64_MIN : static_cast<int64_t>(d);
+                    if (r < rmin) rmin = r; if (r > rmax) rmax = r;
+                    residuals.push_back(r);
+                } else { residuals.push_back(0); }
+            }
+        }
+
+        uint64_t rw = static_cast<uint64_t>(
+            static_cast<__int128_t>(rmax) - static_cast<__int128_t>(rmin));
+        uint64_t ow = IS_UNSIGNED
+            ? (omax_u - omin_u)
+            : static_cast<uint64_t>(static_cast<__int128_t>(omax_i) - static_cast<__int128_t>(omin_i));
+        if (rw >= ow) {
+            result.intercept_ = 0.0; result.slope_ = 0.0;
+            residuals.clear();
+            if constexpr (IS_UNSIGNED) {
+                constexpr uint64_t mx = static_cast<uint64_t>(std::numeric_limits<NativeT>::max());
+                uint64_t msk = (mx < static_cast<uint64_t>(INT64_MAX)) ? mx : static_cast<uint64_t>(INT64_MAX);
+                for (int64_t i = 0; i < len; ++i) {
+                    bool ok = !nulls || arrow::bit_util::GetBit(nulls, off + i);
+                    if (ok) residuals.push_back(static_cast<int64_t>(static_cast<uint64_t>(vals[i]) & msk));
+                    else residuals.push_back(0);
+                }
+            } else {
+                for (int64_t i = 0; i < len; ++i) {
+                    bool ok = !nulls || arrow::bit_util::GetBit(nulls, off + i);
+                    if (ok) residuals.push_back(static_cast<int64_t>(vals[i]));
+                    else residuals.push_back(0);
+                }
+            }
+        }
+
+        arrow::Int64Builder bld;
+        LIQUID_ARROW_OK(bld.Reserve(len));
+        for (int64_t i = 0; i < len; ++i) {
+            bool ok = !nulls || arrow::bit_util::GetBit(nulls, off + i);
+            if (ok) LIQUID_ARROW_OK(bld.Append(residuals[i]));
+            else LIQUID_ARROW_OK(bld.AppendNull());
+        }
+        result.residuals_ = LiquidPrimitiveArray<arrow::Int64Type>::from_arrow(
+            bld.Finish().ValueOrDie());
+        return result;
+    }
+
+    std::shared_ptr<arrow::Array> to_arrow() const {
+        auto ra = residuals_.to_arrow();
+        auto rt = std::static_pointer_cast<arrow::Int64Array>(ra);
+        int64_t len = rt->length();
+        if (len == 0) return arrow::MakeEmptyArray(
+            arrow::TypeTraits<ArrowType>::type_singleton()).ValueOrDie();
+
+        const int64_t* rd = rt->raw_values();
+        const auto* rn = rt->null_bitmap_data();
+        int64_t ro = rt->offset();
+
+        typename arrow::TypeTraits<ArrowType>::BuilderType bld;
+        LIQUID_ARROW_OK(bld.Reserve(len));
+
+        if constexpr (IS_UNSIGNED) {
+            constexpr uint64_t mx = static_cast<uint64_t>(std::numeric_limits<NativeT>::max());
+            for (int64_t i = 0; i < len; ++i) {
+                bool ok = !rn || arrow::bit_util::GetBit(rn, ro + i);
+                if (ok) {
+                    double pr = slope_ * i + intercept_;
+                    uint64_t p = predict_u64_saturated(pr, mx);
+                    __int128_t s = static_cast<__int128_t>(p) + static_cast<__int128_t>(rd[i]);
+                    NativeT v = static_cast<NativeT>(std::clamp<__int128_t>(s, __int128_t{0}, mx));
+                    LIQUID_ARROW_OK(bld.Append(v));
+                } else { LIQUID_ARROW_OK(bld.AppendNull()); }
+            }
+        } else {
+            constexpr int64_t mi = static_cast<int64_t>(std::numeric_limits<NativeT>::min());
+            constexpr int64_t ma = static_cast<int64_t>(std::numeric_limits<NativeT>::max());
+            for (int64_t i = 0; i < len; ++i) {
+                bool ok = !rn || arrow::bit_util::GetBit(rn, ro + i);
+                if (ok) {
+                    double pr = slope_ * i + intercept_;
+                    int64_t p = predict_i64_saturated(pr, mi, ma);
+                    __int128_t s = static_cast<__int128_t>(p) + static_cast<__int128_t>(rd[i]);
+                    NativeT v = static_cast<NativeT>(std::clamp<__int128_t>(s,
+                        static_cast<__int128_t>(mi), static_cast<__int128_t>(ma)));
+                    LIQUID_ARROW_OK(bld.Append(v));
+                } else { LIQUID_ARROW_OK(bld.AppendNull()); }
+            }
+        }
+        return bld.Finish().ValueOrDie();
+    }
+
+    std::vector<uint8_t> to_bytes() const {
+        std::vector<uint8_t> out; out.reserve(256);
+        LiquidIPCHeader hdr(LiquidDataType::LinearInteger, ArrowPhysicalType<ArrowType>::value);
+        hdr.serialize(out);
+        uint64_t ib; std::memcpy(&ib, &intercept_, 8);
+        out.insert(out.end(), reinterpret_cast<const uint8_t*>(&ib),
+                   reinterpret_cast<const uint8_t*>(&ib) + 8);
+        uint64_t sb; std::memcpy(&sb, &slope_, 8);
+        out.insert(out.end(), reinterpret_cast<const uint8_t*>(&sb),
+                   reinterpret_cast<const uint8_t*>(&sb) + 8);
+        while (out.size() % 8 != 0) out.push_back(0);
+        auto rb = residuals_.to_bytes();
+        out.insert(out.end(), rb.begin(), rb.end());
+        return out;
+    }
+
+    static LiquidLinearIntegerArray from_bytes(const uint8_t* data, size_t len) {
+        auto hdr = LiquidIPCHeader::deserialize(data, len);
+        if (hdr.logical_type_id != static_cast<uint16_t>(LiquidDataType::LinearInteger))
+            throw std::runtime_error("Expected LinearInteger logical type");
+        LiquidLinearIntegerArray r;
+        size_t off = LiquidIPCHeader::SIZE;
+        uint64_t ib; std::memcpy(&ib, data + off, 8);
+        std::memcpy(&r.intercept_, &ib, 8); off += 8;
+        uint64_t sb; std::memcpy(&sb, data + off, 8);
+        std::memcpy(&r.slope_, &sb, 8); off += 8;
+        off = align8(off);
+        r.residuals_ = LiquidPrimitiveArray<arrow::Int64Type>::from_bytes(data + off, len - off);
+        return r;
+    }
+
+    uint32_t length() const { return residuals_.length(); }
+    size_t memory_size() const { return residuals_.memory_size() + sizeof(*this); }
+    double intercept() const { return intercept_; }
+    double slope() const { return slope_; }
+    uint8_t bit_width() const { return residuals_.bit_width(); }
+
+#ifdef LIQUID_ENABLE_VELOX
+    facebook::velox::VectorPtr to_velox(
+        facebook::velox::memory::MemoryPool* pool) const;
+#endif
+
+private:
+    double intercept_ = 0.0;
+    double slope_ = 0.0;
+    LiquidPrimitiveArray<arrow::Int64Type> residuals_;
+};
+
+using LiquidLinearI32Array = LiquidLinearIntegerArray<arrow::Int32Type>;
+using LiquidLinearI64Array = LiquidLinearIntegerArray<arrow::Int64Type>;
+using LiquidLinearU32Array = LiquidLinearIntegerArray<arrow::UInt32Type>;
+using LiquidLinearU64Array = LiquidLinearIntegerArray<arrow::UInt64Type>;
+using LiquidLinearDate32Array = LiquidLinearIntegerArray<arrow::Date32Type>;
+using LiquidLinearDate64Array = LiquidLinearIntegerArray<arrow::Date64Type>;
+
+
 
 // ═══════════════════════════════════════════════════════════════════════
 // LiquidFloatArray<T>
@@ -277,6 +617,25 @@ struct Exponents {
     uint8_t f = 0;
 };
 
+/// Squeeze policy for float arrays.
+enum class FloatSqueezePolicy : uint8_t {
+    Quantize = 0,
+};
+
+/// Comparison operators for predicate pushdown on squeezed arrays.
+enum class Operator : uint8_t {
+    Eq, NotEq, Lt, LtEq, Gt, GtEq
+};
+
+/// Abstract interface for reading squeezed data from persistent storage.
+class SqueezeIoHandler {
+public:
+    virtual ~SqueezeIoHandler() = default;
+    virtual std::vector<uint8_t> read(uint64_t offset, uint64_t length) = 0;
+};
+
+// Forward declaration for squeeze() return type.
+template <typename FloatT> class LiquidFloatQuantizedArray;
 /// Precomputed powers of 10 for float32.
 static const float F10_F32[] = {
     1.0f, 10.0f, 100.0f, 1000.0f, 10000.0f, 100000.0f,
@@ -371,6 +730,7 @@ public:
         if (typed->null_count() == len) {
             result.exponent_ = {0, 0};
             result.reference_value_ = 0;
+            result.squeeze_policy_ = FloatSqueezePolicy::Quantize;
             std::vector<uint64_t> zeros(len, 0);
             std::vector<uint8_t> null_bits((len + 7) / 8, 0);
             result.bit_packed_ = BitPackedArray(zeros.data(), null_bits.data(),
@@ -451,6 +811,7 @@ public:
         result.bit_packed_ = BitPackedArray(offsets.data(), null_bitmap,
                                              static_cast<uint32_t>(len), bw);
         return result;
+        result.squeeze_policy_ = FloatSqueezePolicy::Quantize;
     }
 
     /// Decode back to an Arrow array.
@@ -546,6 +907,19 @@ public:
     const std::vector<FloatT>& patch_values() const { return patch_values_; }
     Exponents exponents() const { return exponent_; }
     SignedInt reference_value() const { return reference_value_; }
+    FloatSqueezePolicy squeeze_policy() const { return squeeze_policy_; }
+
+    /// Squeeze to reduce in-memory footprint. Returns quantized array + disk bytes.
+    /// When bit_width >= 8, halves the bit width and stores full precision on disk.
+    /// Defined after LiquidFloatQuantizedArray<T> (needs complete type).
+    std::optional<std::pair<LiquidFloatQuantizedArray<FloatT>, std::vector<uint8_t> > >
+    squeeze(std::shared_ptr<SqueezeIoHandler> io) const;
+
+#ifdef LIQUID_ENABLE_VELOX
+    /// Decode directly to Velox FlatVector via ALP + BitPacking + Patching.
+    facebook::velox::VectorPtr to_velox(
+        facebook::velox::memory::MemoryPool* pool) const;
+#endif
 
     /// Deserialize from bytes (matches Rust LiquidFloatArray::from_bytes).
     static LiquidFloatArray from_bytes(const uint8_t* data, size_t len) {
@@ -604,6 +978,7 @@ public:
             result.bit_packed_ = BitPackedArray::deserialize(data + next, len - next);
         }
 
+        result.squeeze_policy_ = FloatSqueezePolicy::Quantize;
         return result;
     }
 
@@ -660,7 +1035,205 @@ private:
     BitPackedArray bit_packed_;
     std::vector<uint64_t> patch_indices_;
     std::vector<FloatT> patch_values_;
+    FloatSqueezePolicy squeeze_policy_ = FloatSqueezePolicy::Quantize;
 };
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// LiquidFloatQuantizedArray<T>
+//
+// Squeezed (half-resolution) float array for memory-to-disk hybrid storage.
+// Created by LiquidFloatArray::squeeze().
+// ═══════════════════════════════════════════════════════════════════════
+
+template <typename FloatT>
+class LiquidFloatQuantizedArray {
+public:
+    using Traits = ALPTraits<FloatT>;
+    using SignedInt = typename Traits::SignedInt;
+    using UnsignedInt = typename Traits::UnsignedInt;
+    using ArrowType = typename Traits::ArrowType;
+
+    LiquidFloatQuantizedArray() = default;
+
+    /// Hydrate from disk and decode to Arrow array.
+    std::shared_ptr<arrow::Array> to_arrow() const {
+        auto bytes = io_->read(disk_offset_, disk_length_);
+        auto liquid = LiquidFloatArray<FloatT>::from_bytes(bytes.data(), bytes.size());
+        return liquid.to_arrow();
+    }
+
+    uint32_t length() const { return quantized_.length(); }
+
+    size_t memory_size() const {
+        return quantized_.memory_size() +
+               patch_indices_.size() * 8 +
+               patch_values_.size() * sizeof(FloatT) +
+               sizeof(*this);
+    }
+
+    /// Predicate helpers: given [lo, hi] bucket range and literal k,
+    /// return true/false if definite, nullopt if ambiguous.
+    static std::optional<bool> handle_eq(FloatT lo, FloatT hi, FloatT k) {
+        if (k < lo || k > hi) return false; return std::nullopt;
+    }
+    static std::optional<bool> handle_neq(FloatT lo, FloatT hi, FloatT k) {
+        if (k < lo || k > hi) return true; return std::nullopt;
+    }
+    static std::optional<bool> handle_lt(FloatT lo, FloatT hi, FloatT k) {
+        if (k <= lo) return false; if (hi < k) return true; return std::nullopt;
+    }
+    static std::optional<bool> handle_lteq(FloatT lo, FloatT hi, FloatT k) {
+        if (k < lo) return false; if (hi <= k) return true; return std::nullopt;
+    }
+    static std::optional<bool> handle_gt(FloatT lo, FloatT hi, FloatT k) {
+        if (k < lo) return true; if (hi <= k) return false; return std::nullopt;
+    }
+    static std::optional<bool> handle_gteq(FloatT lo, FloatT hi, FloatT k) {
+        if (k <= lo) return true; if (hi < k) return false; return std::nullopt;
+    }
+
+    /// Try to evaluate a comparison predicate using only the quantized
+    /// representation. Returns a BooleanArray if fully resolved,
+    /// or nullptr if NeedsBacking (requires full data from disk).
+    std::shared_ptr<arrow::BooleanArray> try_eval_predicate(
+            Operator op, FloatT literal) const {
+        uint32_t len = quantized_.length();
+
+        using CompFn = std::optional<bool> (*)(FloatT, FloatT, FloatT);
+        CompFn comp = nullptr;
+        switch (op) {
+            case Operator::Eq:    comp = handle_eq;   break;
+            case Operator::NotEq: comp = handle_neq;  break;
+            case Operator::Lt:    comp = handle_lt;   break;
+            case Operator::LtEq:  comp = handle_lteq; break;
+            case Operator::Gt:    comp = handle_gt;   break;
+            case Operator::GtEq:  comp = handle_gteq; break;
+        }
+
+        std::vector<UnsignedInt> unpacked(len);
+        quantized_.bulk_unpack_to(unpacked.data());
+
+        SignedInt q_min = reference_value_ >> bucket_width_;
+        std::vector<uint8_t> result_bits((len + 7) / 8, 0);
+        bool all_decided = true;
+        size_t next_patch = 0;
+        bool ignore = patch_indices_.empty();
+
+        for (uint32_t i = 0; i < len; ++i) {
+            if (quantized_.is_null(i)) continue;
+            if (!ignore && next_patch < patch_indices_.size() &&
+                patch_indices_[next_patch] == i) {
+                ++next_patch;
+                if (next_patch == patch_indices_.size()) ignore = true;
+                continue;
+            }
+
+            SignedInt val = q_min + static_cast<SignedInt>(unpacked[i]);
+            UnsignedInt uv = static_cast<UnsignedInt>(val);
+            SignedInt loe = static_cast<SignedInt>(
+                (uv << bucket_width_) + static_cast<UnsignedInt>(reference_value_));
+            UnsignedInt uvp1 = uv + 1;
+            SignedInt hie = static_cast<SignedInt>(
+                (uvp1 << bucket_width_) + static_cast<UnsignedInt>(reference_value_));
+
+            FloatT lo = LiquidFloatArray<FloatT>::decode_single(loe, exponent_);
+            FloatT hi = LiquidFloatArray<FloatT>::decode_single(hie, exponent_);
+            auto d = comp(lo, hi, literal);
+            if (d.has_value()) {
+                if (d.value()) result_bits[i / 8] |= (1 << (i % 8));
+            } else {
+                all_decided = false; break;
+            }
+        }
+
+        if (!all_decided) return nullptr;
+
+        for (size_t pi = 0; pi < patch_indices_.size(); ++pi) {
+            uint64_t idx = patch_indices_[pi];
+            FloatT pv = patch_values_[pi];
+            bool ok = false;
+            switch (op) {
+                case Operator::Eq:    ok = pv == literal; break;
+                case Operator::NotEq: ok = pv != literal; break;
+                case Operator::Lt:    ok = pv < literal;  break;
+                case Operator::LtEq:  ok = pv <= literal; break;
+                case Operator::Gt:    ok = pv > literal;  break;
+                case Operator::GtEq:  ok = pv >= literal; break;
+            }
+            if (ok) result_bits[idx / 8] |= (1 << (idx % 8));
+        }
+
+        auto vb = arrow::AllocateBuffer((len + 7) / 8).ValueOrDie();
+        std::memcpy(vb->mutable_data(), result_bits.data(), (len + 7) / 8);
+        auto nb = quantized_.null_bitmap_arrow_buffer();
+        return std::make_shared<arrow::BooleanArray>(
+            static_cast<int64_t>(len), std::move(vb), std::move(nb),
+            static_cast<int64_t>(quantized_.null_count()));
+    }
+
+private:
+    friend class LiquidFloatArray<FloatT>;
+
+    Exponents exponent_;
+    BitPackedArray quantized_;
+    SignedInt reference_value_ = 0;
+    uint8_t bucket_width_ = 0;
+    uint64_t disk_offset_ = 0;
+    uint64_t disk_length_ = 0;
+    std::shared_ptr<SqueezeIoHandler> io_;
+    std::vector<uint64_t> patch_indices_;
+    std::vector<FloatT> patch_values_;
+};
+
+/// Out-of-line definition of squeeze() — requires complete
+/// LiquidFloatQuantizedArray<T> type to construct the result.
+template <typename FloatT>
+std::optional<std::pair<LiquidFloatQuantizedArray<FloatT>, std::vector<uint8_t> > >
+LiquidFloatArray<FloatT>::squeeze(std::shared_ptr<SqueezeIoHandler> io) const {
+    uint8_t orig_bw = bit_packed_.bit_width();
+    if (orig_bw < 8) return std::nullopt;
+
+    uint8_t new_bw = orig_bw / 2;
+    uint8_t shift = orig_bw - new_bw;
+    auto full_bytes = to_bytes();
+
+    uint32_t len = bit_packed_.length();
+    std::vector<UnsignedInt> orig_offsets(len);
+    bit_packed_.bulk_unpack_to(orig_offsets.data());
+
+    SignedInt q_min = reference_value_ >> shift;
+    std::vector<uint64_t> quantized_offsets(len, 0);
+    for (uint32_t i = 0; i < len; ++i) {
+        if (bit_packed_.is_null(i)) continue;
+        UnsignedInt uo = orig_offsets[i];
+        UnsignedInt ur = static_cast<UnsignedInt>(reference_value_);
+        SignedInt full = static_cast<SignedInt>(ur + uo);
+        SignedInt qv = full >> shift;
+        UnsignedInt qd = static_cast<UnsignedInt>(qv) - static_cast<UnsignedInt>(q_min);
+        quantized_offsets[i] = static_cast<uint64_t>(qd);
+    }
+
+    auto nb = bit_packed_.null_bitmap_arrow_buffer();
+    const uint8_t* nulls = nb ? nb->data() : nullptr;
+    BitPackedArray qbp(quantized_offsets.data(), nulls, len, new_bw);
+
+    LiquidFloatQuantizedArray<FloatT> hybrid;
+    hybrid.exponent_ = exponent_;
+    hybrid.quantized_ = std::move(qbp);
+    hybrid.reference_value_ = reference_value_;
+    hybrid.bucket_width_ = shift;
+    hybrid.disk_offset_ = 0;
+    hybrid.disk_length_ = full_bytes.size();
+    hybrid.io_ = std::move(io);
+    hybrid.patch_indices_ = patch_indices_;
+    hybrid.patch_values_ = patch_values_;
+
+    return std::make_pair(std::move(hybrid), std::move(full_bytes));
+}
+
+using LiquidFloatQuantized32Array = LiquidFloatQuantizedArray<float>;
+using LiquidFloatQuantized64Array = LiquidFloatQuantizedArray<double>;
 
 using LiquidFloat32Array = LiquidFloatArray<float>;
 using LiquidFloat64Array = LiquidFloatArray<double>;

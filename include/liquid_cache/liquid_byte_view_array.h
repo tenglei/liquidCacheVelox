@@ -576,6 +576,12 @@ public:
                prefix_keys_.size() * 8 + sizeof(*this);
     }
 
+#ifdef LIQUID_ENABLE_VELOX
+    /// Decode directly to Velox FlatVector<StringView>.
+    facebook::velox::VectorPtr to_velox(
+        facebook::velox::memory::MemoryPool* pool) const;
+#endif
+
 private:
     static void pad_to_8(std::vector<uint8_t>& out) {
         while (out.size() % 8 != 0) out.push_back(0);

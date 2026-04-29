@@ -16,6 +16,14 @@
 
 #include "liquid_cache/ipc_header.h"
 
+#ifdef LIQUID_ENABLE_VELOX
+namespace facebook::velox {
+class BaseVector;
+using VectorPtr = std::shared_ptr<BaseVector>;
+namespace memory { class MemoryPool; }
+}  // namespace facebook::velox
+#endif
+
 namespace liquid_cache {
 
 /// Abstract base class for all Liquid-encoded arrays.
@@ -68,6 +76,12 @@ public:
     /// Original Arrow data type (for correct type reconstruction).
     /// Equivalent to Rust LiquidArray::original_arrow_data_type().
     virtual std::shared_ptr<arrow::DataType> original_arrow_type() const = 0;
+
+#ifdef LIQUID_ENABLE_VELOX
+    /// Decode directly to Velox Vector (no Arrow intermediate).
+    virtual facebook::velox::VectorPtr to_velox(
+        facebook::velox::memory::MemoryPool* pool) const = 0;
+#endif
 };
 
 /// Shared pointer to a polymorphic LiquidArrayBase.
@@ -113,6 +127,13 @@ public:
     std::shared_ptr<arrow::DataType> original_arrow_type() const override {
         return original_type_;
     }
+
+#ifdef LIQUID_ENABLE_VELOX
+    facebook::velox::VectorPtr to_velox(
+        facebook::velox::memory::MemoryPool* pool) const override {
+        return inner_.to_velox(pool);
+    }
+#endif
 
     /// Access the underlying concrete Liquid array.
     const LiquidArrayT& inner() const { return inner_; }
