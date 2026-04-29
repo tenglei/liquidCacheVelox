@@ -1,0 +1,462 @@
+name: CI
+
+# ============================================================================
+# liquid-cache-cpp CI Pipeline
+# ============================================================================
+# Jobs:
+#   1. build-and-test   — 基础构建 (Arrow 24, 无 Velox), 矩阵: Debug/Release
+#   2. velox-build      — Velox 集成构建 (仅 workflow_dispatch)
+#
+# 依赖源:
+#   - Apache Arrow 24.0.0: https://packages.apache.org/artifactory/arrow/ubuntu/
+#   - GCC 13.3 (Ubuntu 24.04 自带)
+#   - Google Test: FetchContent (v1.14.0, 构建时自动下载)
+# ============================================================================
+
+"on":
+  push:
+    branches: [main, master]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.gitignore'
+      - '.gitattributes'
+  pull_request:
+    branches: [main, master]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.gitignore'
+      - '.gitattributes'
+  workflow_dispatch:
+    inputs:
+      enable_velox:
+        description: 'Enable Velox integration build'
+        type: boolean
+        default: false
+      velox_git_ref:
+        description: 'Velox git ref to checkout (branch/tag/commit)'
+        type: string
+        default: 'main'
+
+# ── 并发控制: 同一分支/PR 自动取消旧运行 ──────────────────────────────
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/master' }}
+
+env:
+  BUILD_TYPE: ${{ matrix.build_type || 'Release' }}
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Job 1: 基础构建 + 测试 (无 Velox)
+# ══════════════════════════════════════════════════════════════════════════
+jobs:
+  build-and-test:
+    name: "Build (${{ matrix.build_type }})"
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Debug, Release]
+
+    steps:
+      # ── 1. Checkout ─────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      # ── 2. Setup ccache ─────────────────────────────────────────────
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: ${{ runner.os }}-${{ matrix.build_type }}
+          max-size: 512M
+
+      # ── 3. Install system dependencies ──────────────────────────────
+      - name: Install system dependencies
+        run: |
+          set -euo pipefail
+
+          # ── Add Apache Arrow APT repository (for Arrow 24.0.0) ─────
+          # Format: deb822 (.sources), same as production environment
+          sudo mkdir -p /usr/share/keyrings
+
+          for i in {1..3}; do
+            if curl -fsSL --retry 3 --retry-delay 5 \
+              https://packages.apache.org/artifactory/arrow/KEYS \
+              | sudo gpg --dearmor -o /usr/share/keyrings/apache-arrow-apt-source.gpg; then
+              break
+            fi
+            echo "Retrying GPG key download ($i/3)..."
+            sleep 5
+          done
+
+          sudo tee /etc/apt/sources.list.d/apache-arrow.sources > /dev/null <<'APTEOF'
+          Types: deb
+          URIs: https://packages.apache.org/artifactory/arrow/ubuntu/
+          Suites: noble
+          Components: main
+          Signed-By: /usr/share/keyrings/apache-arrow-apt-source.gpg
+          APTEOF
+
+          # ── Install dependencies ────────────────────────────────────
+          sudo apt-get update -qq
+
+          sudo apt-get install -y --no-install-recommends \
+            cmake \
+            make \
+            ninja-build \
+            pkg-config \
+            \
+            libarrow-dev \
+            libarrow-acero-dev \
+            libarrow-compute-dev \
+            libarrow-dataset-dev \
+            libparquet-dev \
+            \
+            libabsl-dev \
+            libbrotli-dev \
+            libbz2-dev \
+            libcurl4-openssl-dev \
+            liblz4-dev \
+            libprotobuf-dev \
+            libre2-dev \
+            libsnappy-dev \
+            libssl-dev \
+            libutf8proc-dev \
+            libzstd-dev \
+            zlib1g-dev \
+            libnghttp2-dev \
+            libkrb5-dev \
+            libxml2-dev \
+            \
+            openjdk-17-jdk
+
+      # ── 4. Verify toolchain ─────────────────────────────────────────
+      - name: Verify toolchain
+        run: |
+          echo "=== GCC version ==="
+          gcc --version | head -1
+          g++ --version | head -1
+
+          echo "=== CMake version ==="
+          cmake --version | head -1
+
+          echo "=== Arrow version ==="
+          pkg-config --modversion arrow 2>/dev/null || echo "Arrow from CMake find_package"
+
+          echo "=== Java (JNI) ==="
+          java -version 2>&1 || true
+
+      # ── 5. Configure CMake ──────────────────────────────────────────
+      - name: Configure CMake
+        env:
+          CC: gcc
+          CXX: g++
+        run: |
+          cmake -S . -B build \
+            -G "Ninja" \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DLIQUID_ENABLE_VELOX=OFF \
+            -DLIQUID_BUILD_TESTS=ON
+
+      # ── 6. Build ────────────────────────────────────────────────────
+      - name: Build all targets
+        run: |
+          cmake --build build -j$(nproc)
+        timeout-minutes: 20
+
+      # ── 7. Run unit tests ───────────────────────────────────────────
+      - name: Run unit tests (CTest)
+        working-directory: build
+        run: |
+          ctest --output-on-failure -j$(nproc)
+        timeout-minutes: 10
+
+      # ── 8. Run non-GTest tests manually ─────────────────────────────
+      - name: Run custom tests
+        run: |
+          echo "=== liquid_float_quantize_test ==="
+          ./build/liquid_float_quantize_test || {
+            echo "::error ::Float quantize test failed"
+            exit 1
+          }
+
+          echo "=== liquid_cache_budget_test ==="
+          ./build/liquid_cache_budget_test || {
+            echo "::error ::Cache budget test failed"
+            exit 1
+          }
+
+          echo "=== liquid_cache_example ==="
+          ./build/liquid_cache_example || {
+            echo "::error ::Example test failed"
+            exit 1
+          }
+
+      # ── 9. Generate test Parquet data ───────────────────────────────
+      - name: Generate test Parquet data
+        run: |
+          echo "=== generate_test_parquet ==="
+          ./build/generate_test_parquet \
+            "${GITHUB_WORKSPACE}/build/ci_test_data.parquet" \
+            100000
+
+          echo "=== verify_parquet ==="
+          ./build/verify_parquet "${GITHUB_WORKSPACE}/build/ci_test_data.parquet"
+
+      # ── 10. Verify generated file ───────────────────────────────────
+      - name: Validate generated Parquet
+        run: |
+          PARQUET_FILE="${GITHUB_WORKSPACE}/build/ci_test_data.parquet"
+
+          if [[ ! -f "$PARQUET_FILE" ]]; then
+            echo "::error ::Parquet file was not generated"
+            exit 1
+          fi
+
+          FILE_SIZE=$(stat --format=%s "$PARQUET_FILE" 2>/dev/null || stat -f%z "$PARQUET_FILE" 2>/dev/null || echo 0)
+          echo "Generated Parquet: $(du -h "$PARQUET_FILE" | cut -f1) (${FILE_SIZE} bytes)"
+
+          if [[ "$FILE_SIZE" -lt 1000 ]]; then
+            echo "::error ::Parquet file too small (${FILE_SIZE} bytes)"
+            exit 1
+          fi
+          echo "::notice ::Parquet generation OK: $(du -h "$PARQUET_FILE" | cut -f1)"
+
+      # ── 11. Verify JNI shared library ───────────────────────────────
+      - name: Verify JNI library
+        run: |
+          JNI_SO="build/libliquid_cache_jni.so"
+
+          if [[ ! -f "$JNI_SO" ]]; then
+            echo "::error ::JNI shared library not found: $JNI_SO"
+            exit 1
+          fi
+
+          echo "JNI library: $(du -h "$JNI_SO" | cut -f1)"
+
+          JNI_SYMBOLS=$(nm -D "$JNI_SO" 2>/dev/null | grep -c 'Java_' || echo 0)
+          if [[ "$JNI_SYMBOLS" -eq 0 ]]; then
+            echo "::warning ::No JNI export symbols found (Java_ prefix)"
+          else
+            echo "JNI export symbols found: $JNI_SYMBOLS"
+          fi
+
+      # ── 12. Verify static libraries ─────────────────────────────────
+      - name: Verify static libraries
+        run: |
+          echo "=== Static libraries ==="
+          for lib in build/libliquid_cache_core.a; do
+            if [[ -f "$lib" ]]; then
+              echo "  $(basename $lib): $(du -h "$lib" | cut -f1)"
+            else
+              echo "::warning ::Missing: $lib"
+            fi
+          done
+
+      # ── 13. Upload build artifacts ──────────────────────────────────
+      - name: Upload test log (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-failure-log-${{ matrix.build_type }}
+          path: |
+            build/Testing/Temporary/LastTest.log
+            build/CMakeFiles/CMakeOutput.log
+            build/CMakeFiles/CMakeError.log
+          retention-days: 7
+
+  # ════════════════════════════════════════════════════════════════════
+  #  Job 2: Velox 集成构建 (仅 workflow_dispatch, enable_velox=true)
+  # ════════════════════════════════════════════════════════════════════
+  velox-build:
+    name: "Velox Build"
+    runs-on: ubuntu-24.04
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.enable_velox == 'true' }}
+    timeout-minutes: 360  # 6 hours max for full Velox build
+
+    steps:
+      # ── 1. Checkout liquid-cache-cpp ───────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Setup ccache ────────────────────────────────────────────
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: ${{ runner.os }}-velox
+          max-size: 2G
+
+      # ── 3. Install system dependencies (including Velox deps) ──────
+      - name: Install system dependencies
+        run: |
+          set -euo pipefail
+
+          # ── Apache Arrow APT repository (deb822 .sources format) ───
+          sudo mkdir -p /usr/share/keyrings
+
+          for i in {1..3}; do
+            if curl -fsSL --retry 3 --retry-delay 5 \
+              https://packages.apache.org/artifactory/arrow/KEYS \
+              | sudo gpg --dearmor -o /usr/share/keyrings/apache-arrow-apt-source.gpg; then
+              break
+            fi
+            echo "Retrying GPG key download ($i/3)..."
+            sleep 5
+          done
+
+          sudo tee /etc/apt/sources.list.d/apache-arrow.sources > /dev/null <<'APTEOF'
+          Types: deb
+          URIs: https://packages.apache.org/artifactory/arrow/ubuntu/
+          Suites: noble
+          Components: main
+          Signed-By: /usr/share/keyrings/apache-arrow-apt-source.gpg
+          APTEOF
+
+          sudo apt-get update -qq
+
+          # ── Base dependencies (same as basic build) ────────────────
+          sudo apt-get install -y --no-install-recommends \
+            cmake make ninja-build pkg-config git curl ccache \
+            libarrow-dev libarrow-acero-dev libarrow-dataset-dev libparquet-dev \
+            libabsl-dev libbrotli-dev libbz2-dev libcurl4-openssl-dev \
+            liblz4-dev libprotobuf-dev libre2-dev libsnappy-dev libssl-dev \
+            libutf8proc-dev libzstd-dev zlib1g-dev \
+            libnghttp2-dev libkrb5-dev libxml2-dev openjdk-17-jdk
+
+          # ── Velox-specific dependencies ────────────────────────────
+          # NOTE: fmt and simdjson are NOT installed from apt because
+          #       Velox bundles them via FetchContent (_deps/)
+          sudo apt-get install -y --no-install-recommends \
+            libboost-all-dev \
+            libgoogle-glog-dev \
+            libgflags-dev \
+            libdouble-conversion-dev \
+            libevent-dev \
+            libsodium-dev \
+            libunwind-dev \
+            liblzma-dev \
+            libicu-dev \
+            libiberty-dev \
+            libdwarf-dev \
+            libelf-dev \
+            libgmock-dev \
+            libjemalloc-dev \
+            libcctz-dev \
+            libxxhash-dev
+
+      # ── 4. Restore Velox cache or build from source ────────────────
+      - name: Restore Velox build cache
+        id: cache-velox
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            /tmp/velox-build
+          key: velox-${{ github.event.inputs.velox_git_ref }}-${{ hashFiles('.github/workflows/ci.yml') }}
+          restore-keys: |
+            velox-${{ github.event.inputs.velox_git_ref }}-
+            velox-main-
+
+      # ── 5. Build Velox from source (if not cached) ─────────────────
+      - name: Build Velox from source
+        if: steps.cache-velox.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+
+          VELOX_REF="${{ github.event.inputs.velox_git_ref }}"
+          VELOX_SRC="/tmp/velox-src"
+          VELOX_BUILD="/tmp/velox-build"
+
+          # Clone Velox
+          if [[ ! -d "$VELOX_SRC" ]]; then
+            git clone --depth 1 --branch "$VELOX_REF" \
+              https://github.com/facebookincubator/velox.git "$VELOX_SRC"
+          fi
+
+          # Create build directory
+          mkdir -p "$VELOX_BUILD"
+
+          # Configure Velox (minimal build: only what we need)
+          # Using bundled Arrow 18 for ABI compatibility
+          # NOTE: This is a full Velox build which takes 1-3 hours.
+          #       Subsequent runs benefit from ccache.
+          cd "$VELOX_BUILD"
+
+          cmake "$VELOX_SRC" \
+            -G "Ninja" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DVELOX_ENABLE_PARQUET=ON \
+            -DVELOX_BUILD_TESTING=OFF \
+            -DVELOX_BUILD_BENCHMARKS=OFF \
+            -DVELOX_ENABLE_DUCKDB=ON \
+            -DVELOX_BUILD_VECTOR_FUZZER=OFF
+
+          # Build (limit parallelism to avoid OOM on CI runners)
+          cmake --build . -j$(nproc || echo 2)
+
+          echo "::notice ::Velox build completed at $VELOX_BUILD"
+
+      # ── 6. Save Velox build cache ──────────────────────────────────
+      - name: Save Velox build cache
+        if: steps.cache-velox.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            /tmp/velox-build
+          key: ${{ steps.cache-velox.outputs.cache-primary-key }}
+
+      # ── 7. Build liquid-cache-cpp with Velox ───────────────────────
+      - name: Build with Velox integration
+        env:
+          CC: gcc
+          CXX: g++
+        run: |
+          VELOX_BUILD="/tmp/velox-build"
+
+          cmake -S . -B build-velox \
+            -G "Ninja" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DLIQUID_ENABLE_VELOX=ON \
+            -DVELOX_PREFIX="$VELOX_BUILD" \
+            -DLIQUID_BUILD_TESTS=ON
+
+          cmake --build build-velox -j$(nproc)
+        timeout-minutes: 20
+
+      # ── 8. Run Velox tests ─────────────────────────────────────────
+      - name: Run Velox unit tests
+        working-directory: build-velox
+        run: |
+          ctest --output-on-failure -j$(nproc)
+        timeout-minutes: 10
+
+      # ── 9. Verify Velox benchmark binary ──────────────────────────
+      - name: Verify Velox benchmark
+        run: |
+          BENCHMARK="./build-velox/liquid_velox_benchmark"
+          if [[ ! -x "$BENCHMARK" ]]; then
+            echo "::error ::Velox benchmark not found: $BENCHMARK"
+            exit 1
+          fi
+          echo "Velox benchmark: $(du -h "$BENCHMARK" | cut -f1)"
+          echo "::notice ::Velox benchmark binary built successfully"
+
+      # ── 10. Upload failure logs ───────────────────────────────────
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: velox-failure-log
+          path: |
+            build-velox/Testing/Temporary/LastTest.log
+            build-velox/CMakeFiles/CMakeOutput.log
+            build-velox/CMakeFiles/CMakeError.log
+          retention-days: 7

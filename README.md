@@ -38,6 +38,281 @@ liquid-cache-cpp/
     └── test_cache_budget.cpp         # 缓存预算和 LRU 测试
 ```
 
+## 自动化脚本
+
+项目提供四个自动化脚本，位于 `scripts/` 目录下，覆盖从测试数据生成、Velox benchmark 构建、JNI 库构建到完整测试运行的常见操作。
+
+### 脚本一览
+
+| 脚本 | 功能 | 典型耗时 |
+|------|------|----------|
+| `generate_test_parquet.sh` | 构建并运行 Parquet 测试数据生成器 | 10-15s |
+| `build_velox_benchmark.sh` | 配置并编译 Velox 集成 benchmark | 30-60s |
+| `build_jni_library.sh` | 编译 JNI 共享库 (.so) | 10-20s |
+| `run_all_tests.sh` | 运行全部单元测试 + Parquet 验证 | 构建+测试 ~2min |
+
+所有脚本均支持 `-h/--help` 查看完整帮助，`-n/--dry-run` 预览将执行的命令，`-d/--build-dir` 指定构建目录。
+
+---
+
+### 1. `generate_test_parquet.sh` — 生成测试 Parquet 数据
+
+构建 `generate_test_parquet` 工具并生成包含 20 列、覆盖全部 Liquid Cache 支持格式的 Parquet 测试文件。
+
+**用法：**
+
+```bash
+./scripts/generate_test_parquet.sh [选项]
+```
+
+**常用参数：**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `-o, --output <path>` | `build/test_data_512mb.parquet` | 输出文件路径 |
+| `-s, --size <GB>` | — | 目标文件大小（GB），自动换算行数 |
+| `-r, --rows <count>` | `5000000` | 目标行数 |
+| `-c, --compression <c>` | `snappy` | 压缩格式（snappy/gzip/zstd/lz4/brotli/none） |
+| `-d, --build-dir <dir>` | `build` | CMake 构建目录 |
+| `-j <N>` | `nproc` | 并行编译任务数 |
+| `-n, --dry-run` | — | 仅显示命令，不实际执行 |
+
+**使用场景：**
+
+- 首次搭建环境后生成基准测试数据
+- 生成不同规模的 Parquet 文件用于性能测试
+- 为 `liquid_velox_benchmark` 和 `verify_parquet` 提供输入
+
+**示例：**
+
+```bash
+# 默认配置（5M 行，~512MB，Snappy 压缩）
+./scripts/generate_test_parquet.sh
+
+# 生成 ~1GB 的 Parquet 文件
+./scripts/generate_test_parquet.sh -s 1
+
+# 自定义行数和输出路径
+./scripts/generate_test_parquet.sh -r 10000000 -o /tmp/large.parquet
+
+# 指定不同构建目录
+./scripts/generate_test_parquet.sh -d build_debug -s 2
+```
+
+**注意：** 当前 C++ 工具内置固定 20 列、Snappy 压缩。脚本会在使用其他压缩或列数时发出警告，提示需修改 C++ 源码。
+
+---
+
+### 2. `build_velox_benchmark.sh` — 构建 Velox 集成 Benchmark
+
+配置并编译 `liquid_velox_benchmark`，包含 ABI 兼容性检查（Velox bundled Arrow 18 vs 系统 Arrow 24）。
+
+**用法：**
+
+```bash
+./scripts/build_velox_benchmark.sh [选项]
+```
+
+**常用参数：**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `-p, --velox-prefix <path>` | `/home/tenglei/code/velox/build` | Velox 构建目录路径 |
+| `-d, --build-dir <dir>` | `build` | CMake 构建目录 |
+| `-t, --build-type <type>` | `Release` | 构建类型（Release/Debug） |
+| `-j <N>` | `nproc` | 并行编译任务数 |
+| `--clean` | — | 清理构建目录后重新配置 |
+| `-n, --dry-run` | — | 仅显示命令，不实际执行 |
+
+**使用场景：**
+
+- 系统/项目已有完整 Velox 构建产物
+- 需要生成 `liquid_velox_benchmark` 二进制进行性能对比
+- CI/CD 中自动构建 Velox benchmark
+
+**示例：**
+
+```bash
+# 默认配置（使用 ~/code/velox/build）
+./scripts/build_velox_benchmark.sh
+
+# 指定 Velox 构建路径
+./scripts/build_velox_benchmark.sh -p /opt/velox/build
+
+# 清理后重新构建（Debug 模式）
+./scripts/build_velox_benchmark.sh --clean -t Debug -j 8
+```
+
+**产出文件：**
+- `build/liquid_velox_benchmark` — Velox 性能基准测试可执行文件
+- `build/libliquid_cache_velox.a` — Velox 集成静态库
+
+**ABI 注意事项：** 脚本会自动检测系统 Arrow 版本与 Velox bundled Arrow 18 的冲突并给出警告。编译选项 `-mavx2 -mfma -mavx -mf16c -mlzcnt -mbmi2` 确保与 Velox 的 ABI 兼容。
+
+---
+
+### 3. `build_jni_library.sh` — 构建 JNI 共享库
+
+编译 `libliquid_cache_jni.so`，包含 JNI 头文件检测、动态库依赖分析和 JNI 符号导出验证。
+
+**用法：**
+
+```bash
+./scripts/build_jni_library.sh [选项]
+```
+
+**常用参数：**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `-d, --build-dir <dir>` | `build` | CMake 构建目录 |
+| `-t, --build-type <type>` | `Release` | 构建类型（Release/Debug） |
+| `-j <N>` | `nproc` | 并行编译任务数 |
+| `--clean` | — | 清理构建目录后重新配置 |
+| `--with-velox <path>` | — | 同时启用 Velox（不推荐，见下文） |
+| `-n, --dry-run` | — | 仅显示命令，不实际执行 |
+
+**使用场景：**
+
+- 需要在 Java/Scala 中通过 JNI 调用 Liquid Cache
+- 验证 JNI 符号导出正确性
+- CI/CD 中检查 JNI 库是否能正常构建
+
+**示例：**
+
+```bash
+# 默认配置
+./scripts/build_jni_library.sh
+
+# Debug 构建 + 清理
+./scripts/build_jni_library.sh -t Debug --clean
+
+# 自定义构建目录
+./scripts/build_jni_library.sh -d build_jni
+```
+
+**重要警告：** 不建议使用 `--with-velox`。JNI 代码基于系统 Arrow 24 API，与 Velox bundled Arrow 18 ABI 不兼容。若构建目录中已有 Velox 缓存配置，脚本会自动检测并强制禁用 Velox（`-DLIQUID_ENABLE_VELOX=OFF`）。
+
+**高级说明：** 构建完成后脚本会执行：
+- `ldd` / `readelf` 动态库依赖分析
+- `nm` JNI 符号检查（`Java_` 前缀导出函数）
+
+---
+
+### 4. `run_all_tests.sh` — 运行全部测试
+
+构建（可选）并运行所有单元测试套件和 Parquet 验证，生成 PASS/FAIL/SKIP 汇总报告。
+
+**用法：**
+
+```bash
+./scripts/run_all_tests.sh [选项]
+```
+
+**常用参数：**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `-p, --parquet <path>` | `build/test_data_512mb.parquet` | Parquet 测试文件路径 |
+| `-d, --build-dir <dir>` | `build` | CMake 构建目录 |
+| `-t, --build-type <type>` | `Release` | 构建类型（Release/Debug） |
+| `-j <N>` | `nproc` | 并行编译任务数 |
+| `--with-velox <path>` | — | 启用 Velox 交叉验证测试 |
+| `--clean` | — | 清理构建目录后重新配置 |
+| `--no-build` | — | 跳过构建，仅运行已有测试 |
+| `--gtest-filter <f>` | `*` | Google Test 过滤器 |
+| `-n, --dry-run` | — | 仅显示命令，不实际执行 |
+
+**测试套件：**
+
+| 序号 | 测试名称 | 二进制文件 | 说明 |
+|------|----------|-----------|------|
+| 1 | 核心往返测试 | `liquid_cache_tests` | 编解码往返正确性（37 tests） |
+| 2 | Velox 交叉验证 | `liquid_velox_tests` | 仅 `--with-velox` 时运行 |
+| 3 | LinearInteger 测试 | `liquid_linear_test` | 线性整数编码测试 |
+| 4 | 浮点量化测试 | `liquid_float_quantize_test` | 浮点量化算法测试（10 tests） |
+| 5 | 缓存预算/LRU 测试 | `liquid_cache_budget_test` | 缓存策略测试（19 tests） |
+| 6 | Parquet 文件验证 | `verify_parquet` | 行数/列数/Row Group 完整性 |
+
+**使用场景：**
+
+- 开发完成后验证所有功能正确性
+- 修改编码算法后运行回归测试
+- CI/CD 流水线中的自动化测试步骤
+
+**示例：**
+
+```bash
+# 完整测试流程（构建 + 全部测试）
+./scripts/run_all_tests.sh
+
+# 仅运行测试（跳过编译）
+./scripts/run_all_tests.sh --no-build
+
+# 指定 Parquet 文件并只运行特定 Google Test
+./scripts/run_all_tests.sh -p /tmp/test.parquet --gtest-filter "LiquidCache*"
+
+# 启用 Velox 集成测试
+./scripts/run_all_tests.sh --with-velox /home/tenglei/code/velox/build
+```
+
+**输出示例（汇总报告）：**
+
+```
+╔══════════════════════════════════════════════════════════════╗
+║                    测试汇总报告                             ║
+╚══════════════════════════════════════════════════════════════╝
+
+  总计测试套件:  6
+  通过:          4
+  失败:          0
+  跳过:          2
+  总耗时:        125s
+
+  序号 测试名称                             状态       耗时/详情
+  ---- ----------------------------------- ---------- --------------------
+  1    核心往返测试 (test_roundtrip)        PASS       3.2s
+  2    Velox 交叉验证 (test_velox_crossval) SKIP       未启用Velox
+  3    LinearInteger 测试                   PASS       0.5s
+  4    浮点量化测试                         PASS       0.3s
+  5    缓存预算/LRU 测试                    PASS       2.1s
+  6    Parquet 文件验证                     PASS       1.8s
+
+  ✓ 所有测试通过!
+```
+
+---
+
+### 典型工作流
+
+以下展示如何将四个脚本组合使用，覆盖从零开始到完整验证的流程：
+
+```bash
+cd /home/tenglei/code/liquid-cache-cpp
+
+# ── Step 1: 生成测试 Parquet 数据 ──────────────────────────
+./scripts/generate_test_parquet.sh -s 1 -o build/test_1gb.parquet
+
+# ── Step 2: 运行全部单元测试（验证核心功能） ───────────────
+./scripts/run_all_tests.sh -p build/test_1gb.parquet
+
+# ── Step 3: 构建 Velox Benchmark（如有 Velox） ─────────────
+./scripts/build_velox_benchmark.sh -p /home/tenglei/code/velox/build
+
+# ── Step 4: 验证 Velox 转换正确性 ─────────────────────────
+./build/liquid_velox_benchmark build/test_1gb.parquet verify
+
+# ── Step 5: 运行 Velox 性能基准测试 ────────────────────────
+./build/liquid_velox_benchmark build/test_1gb.parquet bench
+
+# ── Step 6: 构建 JNI 共享库（供 Java 调用） ────────────────
+./scripts/build_jni_library.sh
+```
+
+**CI/CD 集成：**
+
+GitHub Actions workflow 文件位于 `.github/workflows/ci.yml`，自动执行本项目的构建、测试和验证流程。详见 workflow 文件中的注释。
+
 ## 前置依赖
 
 ### 编译器
