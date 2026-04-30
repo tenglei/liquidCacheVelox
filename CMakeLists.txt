@@ -262,19 +262,12 @@ target_link_libraries(generate_test_parquet PRIVATE
 )
 
 # ══════════════════════════════════════════════════════════════════
-# Target 5: verify_parquet  (temporary verifier)
+# Target 5: verify_parquet  (Parquet 文件完整性验证工具)
 # ══════════════════════════════════════════════════════════════════
 add_executable(verify_parquet
     tools/verify_parquet.cpp
 )
-target_include_directories(verify_parquet PRIVATE
-    ${CMAKE_SOURCE_DIR}/include
-    ${Arrow_INCLUDE_DIR}
-    ${Parquet_INCLUDE_DIR}
-)
-target_link_libraries(verify_parquet PRIVATE
-    ${STATIC_LINK_LIBS}
-)
+
 
 # ══════════════════════════════════════════════════════════════════
 # Velox Integration (optional, requires LIQUID_ENABLE_VELOX=ON)
@@ -432,6 +425,29 @@ if(LIQUID_ENABLE_VELOX AND VELOX_PREFIX)
     )
 
     message(STATUS "Velox integration targets: liquid_cache_velox, liquid_velox_benchmark")
+
+# verify_parquet Velox/non-Velox dual-mode linking
+if(LIQUID_ENABLE_VELOX AND VELOX_PREFIX)
+    target_include_directories(verify_parquet PRIVATE
+        ${_VELOX_ARROW_INC}
+    )
+    target_link_libraries(verify_parquet PRIVATE
+        -Wl,--start-group
+        ${VELOX_ALL_LIBS}
+        ${VELOX_ARROW_LINK_LIBS}
+        -Wl,--end-group
+        ${VELOX_TRANSITIVE_DEPS}
+    )
+else()
+    target_include_directories(verify_parquet PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${Arrow_INCLUDE_DIR}
+        ${Parquet_INCLUDE_DIR}
+    )
+    target_link_libraries(verify_parquet PRIVATE
+        ${STATIC_LINK_LIBS}
+    )
+endif()
 else()
     if(LIQUID_ENABLE_VELOX AND NOT VELOX_PREFIX)
         message(WARNING "LIQUID_ENABLE_VELOX is ON but VELOX_PREFIX is not set. "
@@ -508,16 +524,37 @@ if(LIQUID_BUILD_TESTS)
         )
         gtest_discover_tests(liquid_velox_tests)
 
-        # LinearInteger roundtrip test (Arrow, no Velox)
-        add_executable(liquid_linear_test tests/test_linear_integer.cpp)
+    endif()
+    # LinearInteger roundtrip test (Arrow-based, no Velox dependency)
+    add_executable(liquid_linear_test tests/test_linear_integer.cpp)
+    if(LIQUID_ENABLE_VELOX AND VELOX_PREFIX)
         target_include_directories(liquid_linear_test PRIVATE
             ${CMAKE_SOURCE_DIR}/include
             ${_VELOX_ARROW_INC}
         )
         target_link_libraries(liquid_linear_test PRIVATE
+            -Wl,--start-group
+            liquid_cache_core
+            liquid_cache_velox
+            ${VELOX_ALL_LIBS}
             ${VELOX_ARROW_LINK_LIBS}
+            -Wl,--end-group
+            ${VELOX_TRANSITIVE_DEPS}
+            GTest::gtest_main
+        )
+    else()
+        target_include_directories(liquid_linear_test PRIVATE
+            ${CMAKE_SOURCE_DIR}/include
+            ${Arrow_INCLUDE_DIR}
+            ${Parquet_INCLUDE_DIR}
+        )
+        target_link_libraries(liquid_linear_test PRIVATE
+            liquid_cache_core
+            ${STATIC_LINK_LIBS}
+            GTest::gtest_main
         )
     endif()
+    gtest_discover_tests(liquid_linear_test)
 
     # Float Quantization (Squeeze) roundtrip test (Arrow, no Velox)
     add_executable(liquid_float_quantize_test tests/test_float_quantize.cpp)
@@ -527,7 +564,14 @@ if(LIQUID_BUILD_TESTS)
             ${_VELOX_ARROW_INC}
         )
         target_link_libraries(liquid_float_quantize_test PRIVATE
+            -Wl,--start-group
+            liquid_cache_core
+            liquid_cache_velox
+            ${VELOX_ALL_LIBS}
             ${VELOX_ARROW_LINK_LIBS}
+            -Wl,--end-group
+            ${VELOX_TRANSITIVE_DEPS}
+            GTest::gtest_main
         )
     else()
         target_include_directories(liquid_float_quantize_test PRIVATE
@@ -536,9 +580,12 @@ if(LIQUID_BUILD_TESTS)
             ${Parquet_INCLUDE_DIR}
         )
         target_link_libraries(liquid_float_quantize_test PRIVATE
+            liquid_cache_core
             ${STATIC_LINK_LIBS}
+            GTest::gtest_main
         )
     endif()
+    gtest_discover_tests(liquid_float_quantize_test)
 
     # Cache budget + LRU eviction test
     add_executable(liquid_cache_budget_test tests/test_cache_budget.cpp)
@@ -548,7 +595,14 @@ if(LIQUID_BUILD_TESTS)
             ${_VELOX_ARROW_INC}
         )
         target_link_libraries(liquid_cache_budget_test PRIVATE
+            -Wl,--start-group
+            liquid_cache_core
+            liquid_cache_velox
+            ${VELOX_ALL_LIBS}
             ${VELOX_ARROW_LINK_LIBS}
+            -Wl,--end-group
+            ${VELOX_TRANSITIVE_DEPS}
+            GTest::gtest_main
         )
     else()
         target_include_directories(liquid_cache_budget_test PRIVATE
@@ -557,8 +611,31 @@ if(LIQUID_BUILD_TESTS)
             ${Parquet_INCLUDE_DIR}
         )
         target_link_libraries(liquid_cache_budget_test PRIVATE
+            liquid_cache_core
             ${STATIC_LINK_LIBS}
+            GTest::gtest_main
         )
     endif()
+    gtest_discover_tests(liquid_cache_budget_test)
+
+    # BitPackedArray unit tests (header-only, no Arrow dependency)
+    add_executable(liquid_bit_packed_test tests/test_bit_packed.cpp)
+    target_include_directories(liquid_bit_packed_test PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+    )
+    target_link_libraries(liquid_bit_packed_test PRIVATE
+        GTest::gtest_main
+    )
+    gtest_discover_tests(liquid_bit_packed_test)
+
+    # IPC Header unit tests (header-only, no Arrow dependency)
+    add_executable(liquid_ipc_header_test tests/test_ipc_header.cpp)
+    target_include_directories(liquid_ipc_header_test PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+    )
+    target_link_libraries(liquid_ipc_header_test PRIVATE
+        GTest::gtest_main
+    )
+    gtest_discover_tests(liquid_ipc_header_test)
 endif()
 

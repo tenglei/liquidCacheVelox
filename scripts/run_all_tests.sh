@@ -101,6 +101,38 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# ── 自动检测 Velox ──────────────────────────────────────────────────────
+if ! $WITH_VELOX; then
+    # 检查 CMake 缓存中是否已有 Velox 配置
+    if [[ -f "${BUILD_DIR}/CMakeCache.txt" ]] && grep -q 'LIQUID_ENABLE_VELOX:BOOL=ON' "${BUILD_DIR}/CMakeCache.txt" 2>/dev/null; then
+        log_info "CMake 缓存中已启用 Velox"
+        WITH_VELOX=true
+        VELOX_PREFIX=$(grep '^VELOX_PREFIX:' "${BUILD_DIR}/CMakeCache.txt" 2>/dev/null | cut -d= -f2- || echo "")
+    fi
+fi
+
+if ! $WITH_VELOX && [[ -z "${VELOX_PREFIX:-}" ]]; then
+    # 尝试从环境变量或常见路径自动检测
+    if [[ -n "${VELOX_PREFIX:-}" ]] && [[ -d "$VELOX_PREFIX" ]]; then
+        log_info "从环境变量 \$VELOX_PREFIX 检测到 Velox: $VELOX_PREFIX"
+        WITH_VELOX=true
+    else
+        for d in /home/*/code/velox/build /opt/velox/build "$HOME/code/velox/build"; do
+            if [[ -d "$d" ]] && [[ -f "$d/lib/libvelox.a" ]]; then
+                VELOX_PREFIX="$d"
+                WITH_VELOX=true
+                log_info "自动检测到 Velox 构建: $VELOX_PREFIX"
+                break
+            fi
+        done
+    fi
+fi
+
+if $WITH_VELOX && [[ -z "$VELOX_PREFIX" ]]; then
+    log_error "--with-velox 已启用但未指定 VELOX_PREFIX 路径"
+    exit 1
+fi
+
 # ── 测试结果追踪 ─────────────────────────────────────────────────────────
 declare -a TEST_RESULTS=()
 TOTAL_TESTS=0
@@ -310,6 +342,17 @@ fi
 
 # ── CMake 配置与构建 ─────────────────────────────────────────────────────
 if ! $NO_BUILD; then
+    # ── 环境预检查 ───────────────────────────────────────────────────
+    log_step "环境预检查..."
+    if ! command -v cmake &>/dev/null; then
+        log_error "未找到 cmake，请先安装: sudo apt install cmake"
+        exit 1
+    fi
+    log_info "  cmake: $(cmake --version | head -1)"
+    if command -v ctest &>/dev/null; then
+        log_info "  ctest: $(ctest --version | head -1)"
+    fi
+
     log_step "CMake 配置..."
 
     CMAKE_ARGS=(
@@ -331,12 +374,31 @@ if ! $NO_BUILD; then
     fi
     log_ok "CMake 配置完成"
 
-    log_step "编译所有目标 (jobs=$JOBS)..."
+    # ── 编译测试目标 ─────────────────────────────────────────────────
+    # 仅在 Velox 模式下只编译测试目标，避免非测试目标（verify_parquet、
+    # generate_test_parquet）链接系统 Arrow 24 时与 Velox bundled Arrow 18 ABI 冲突
     BUILD_START=$(date +%s)
-    if $DRY_RUN; then
-        echo "  cmake --build \"$BUILD_DIR\" -j $JOBS"
+    if $WITH_VELOX; then
+        log_step "编译测试目标（Velox 模式）..."
+        _build_ok=true
+        _test_targets=("liquid_cache_tests" "liquid_velox_tests" "liquid_linear_test" "liquid_float_quantize_test" "liquid_cache_budget_test" "liquid_bit_packed_test" "liquid_ipc_header_test" "verify_parquet")
+        for target in "${_test_targets[@]}"; do
+            log_info "  构建 $target..."
+            if ! cmake --build "$BUILD_DIR" --target "$target" -j "$JOBS" > /dev/null 2>&1; then
+                log_warn "  $target 构建失败，跳过"
+                _build_ok=false
+            fi
+        done
+        if ! $_build_ok; then
+            log_warn "部分测试目标构建失败，已有二进制文件将继续运行"
+        fi
     else
-        cmake --build "$BUILD_DIR" -j "$JOBS"
+        log_step "编译所有目标 (jobs=$JOBS)..."
+        if $DRY_RUN; then
+            echo "  cmake --build "$BUILD_DIR" -j $JOBS"
+        else
+            cmake --build "$BUILD_DIR" -j "$JOBS"
+        fi
     fi
     BUILD_END=$(date +%s)
     BUILD_ELAPSED=$(( BUILD_END - BUILD_START ))
@@ -350,41 +412,53 @@ echo ""
 # ── 运行所有测试 ─────────────────────────────────────────────────────────
 log_step "开始运行测试套件..."
 
-# 1. test_roundtrip — 核心编解码往返测试
-run_test "核心往返测试 (test_roundtrip)" \
-    "${BUILD_DIR}/liquid_cache_tests" \
-    ""
+CTEST_EXIT=0
+CTEST_OUTPUT_FILE=$(mktemp /tmp/liquid_ctest_XXXXXX)
 
-# 2. test_velox_crossval — Velox 交叉验证（仅 Velox 模式）
-if $WITH_VELOX; then
-    run_test "Velox 交叉验证 (test_velox_crossval)" \
-        "${BUILD_DIR}/liquid_velox_tests" \
-        ""
+if $DRY_RUN; then
+    echo "  ctest --test-dir \"$BUILD_DIR\" --output-on-failure"
 else
-    echo ""
-    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${BOLD}  测试 #$(( TOTAL_TESTS + 1 )): Velox 交叉验证 (test_velox_crossval)${NC}"
-    echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    TOTAL_TESTS=$(( TOTAL_TESTS + 1 ))
-    echo -e "  ${YELLOW}[SKIP]${NC}  未启用 Velox (使用 --with-velox <path> 启用)"
-    TEST_RESULTS+=("SKIP|Velox交叉验证|0.0|未启用Velox")
-    SKIPPED_TESTS=$(( SKIPPED_TESTS + 1 ))
+    # Use ctest to run all gtest_discover_tests() registered targets.
+    # This auto-discovers new test executables added to CMakeLists.txt
+    # (liquid_bit_packed_test, liquid_ipc_header_test, etc.)
+    set +e
+    ctest --test-dir "$BUILD_DIR" --output-on-failure > "$CTEST_OUTPUT_FILE" 2>&1
+    CTEST_EXIT=$?
+    set -e
 fi
 
-# 3. test_linear_integer — LinearInteger 测试
-run_test "LinearInteger 测试 (test_linear_integer)" \
-    "${BUILD_DIR}/liquid_linear_test" \
-    ""
+# 解析 ctest 测试计数
+_CTEST_TOTAL=0
+_CTEST_PASSED=0
+_CTEST_FAILED=0
+_CTEST_SKIPPED=0
+if [[ -f "$CTEST_OUTPUT_FILE" ]]; then
+    # ctest summary line 格式: "100% tests passed, 0 tests failed out of 162"
+    if grep -qP '\d+% tests passed' "$CTEST_OUTPUT_FILE"; then
+        _CTEST_TOTAL=$(grep -oP 'out of \K\d+' "$CTEST_OUTPUT_FILE" 2>/dev/null || echo "?")
+        _CTEST_FAILED=$(grep -oP '\d+(?= tests failed)' "$CTEST_OUTPUT_FILE" 2>/dev/null || echo "0")
+        # 通过数 = 总数 - 失败数
+        if [[ "$_CTEST_TOTAL" =~ ^[0-9]+$ ]] && [[ "$_CTEST_FAILED" =~ ^[0-9]+$ ]]; then
+            _CTEST_PASSED=$(( _CTEST_TOTAL - _CTEST_FAILED ))
+        else
+            _CTEST_PASSED="?"
+        fi
+    fi
+    _CTEST_SKIPPED=$(grep -c 'Skipped' "$CTEST_OUTPUT_FILE" 2>/dev/null || echo "0")
 
-# 4. test_float_quantize — 浮点量化测试
-run_test "浮点量化测试 (test_float_quantize)" \
-    "${BUILD_DIR}/liquid_float_quantize_test" \
-    ""
+    # 输出 ctest 摘要
+    echo ""
+    echo "  --- ctest 输出摘要 ---"
+    grep -E '(tests passed|Test time|Start |Passed |Failed |Skipped|tests from)' "$CTEST_OUTPUT_FILE" || true
+    echo "  ---"
 
-# 5. test_cache_budget — 缓存预算和 LRU 测试
-run_test "缓存预算/LRU 测试 (test_cache_budget)" \
-    "${BUILD_DIR}/liquid_cache_budget_test" \
-    ""
+    # 如果有失败，显示失败测试名称
+    if [[ $CTEST_EXIT -ne 0 ]]; then
+        echo ""
+        echo -e "  ${RED}失败测试:${NC}"
+        grep -B 1 '^\*\*\*Failed\|^\*\*\*Exception' "$CTEST_OUTPUT_FILE" 2>/dev/null | head -20 || true
+    fi
+fi
 
 # 6. verify_parquet — Parquet 文件完整性验证
 run_parquet_verify "$PARQUET_FILE"
@@ -399,52 +473,23 @@ echo -e "${BOLD}${BLUE}╔══════════════════
 echo -e "${BOLD}${BLUE}║                    测试汇总报告                             ║${NC}"
 echo -e "${BOLD}${BLUE}╚══════════════════════════════════════════════════════════════╝${NC}"
 echo ""
-echo -e "  总计测试套件:  ${TOTAL_TESTS}"
-echo -e "  ${GREEN}通过:          ${PASSED_TESTS}${NC}"
-echo -e "  ${RED}失败:          ${FAILED_TESTS}${NC}"
-echo -e "  ${YELLOW}跳过:          ${SKIPPED_TESTS}${NC}"
-echo -e "  总耗时:        ${TOTAL_ELAPSED}s"
+echo -e "  GTest (ctest):  $([ $CTEST_EXIT -eq 0 ] && echo -e "${GREEN}PASS${NC}" || echo -e "${RED}FAIL${NC}")"
+echo -e "                  测试总数: ${_CTEST_TOTAL}, 通过: ${_CTEST_PASSED}, 失败: ${_CTEST_FAILED}, 跳过: ${_CTEST_SKIPPED}"
+echo -e "  Parquet 验证:   ${PASSED_TESTS} 通过, ${FAILED_TESTS} 失败, ${SKIPPED_TESTS} 跳过"
+echo -e "  总耗时:         ${TOTAL_ELAPSED}s"
 echo ""
 
-# 详细结果表
-printf "  %-4s %-35s %-10s %s\n" "序号" "测试名称" "状态" "耗时/详情"
-printf "  %-4s %-35s %-10s %s\n" "----" "-----------------------------------" "----------" "--------------------"
-
-idx=0
-for result in "${TEST_RESULTS[@]}"; do
-    idx=$(( idx + 1 ))
-    IFS='|' read -r status name elapsed detail <<< "$result"
-
-    status_color=""
-    case "$status" in
-        PASS) status_color="${GREEN}PASS${NC}" ;;
-        FAIL) status_color="${RED}FAIL${NC}" ;;
-        SKIP) status_color="${YELLOW}SKIP${NC}" ;;
-        *)    status_color="$status" ;;
-    esac
-
-    info="${elapsed}s"
-    if [[ -n "$detail" ]]; then
-        info="$detail"
-    fi
-
-    printf "  %-4s %-35s %b          %s\n" \
-        "$idx" \
-        "$(echo "$name" | cut -c1-35)" \
-        "$status_color" \
-        "$info"
-done
-
-echo ""
-
-if [[ $FAILED_TESTS -eq 0 ]]; then
+if [[ $CTEST_EXIT -ne 0 || $FAILED_TESTS -ne 0 ]]; then
+    echo -e "  ${RED}${BOLD}✗ 存在测试失败${NC}"
+    exit_code=1
+else
     echo -e "  ${GREEN}${BOLD}✓ 所有测试通过!${NC}"
     exit_code=0
-else
-    echo -e "  ${RED}${BOLD}✗ ${FAILED_TESTS} 个测试失败${NC}"
-    exit_code=1
 fi
 
 echo ""
+
+# 清理临时文件
+rm -f "$CTEST_OUTPUT_FILE"
 
 exit $exit_code

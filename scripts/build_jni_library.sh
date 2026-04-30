@@ -94,10 +94,56 @@ if [[ ! "$JOBS" =~ ^[0-9]+$ ]] || [[ "$JOBS" -eq 0 ]]; then
     exit 1
 fi
 
+# ── 环境预检查 ───────────────────────────────────────────────────────────
+log_info "环境预检查..."
+if ! command -v cmake &>/dev/null; then
+    log_error "未找到 cmake，请先安装: sudo apt install cmake"
+    exit 1
+fi
+log_info "  cmake: $(cmake --version | head -1)"
+
+# ── 自动检测 JAVA_HOME ─────────────────────────────────────────────────
+if [[ -z "${JAVA_HOME:-}" ]]; then
+    # 尝试检测已安装的 JDK
+    if command -v java &>/dev/null; then
+        _java_bin=$(readlink -f "$(command -v java)" 2>/dev/null || command -v java)
+        # 从 /usr/lib/jvm/java-X/bin/java 推导 JAVA_HOME
+        if [[ "$_java_bin" == */bin/java ]]; then
+            JAVA_HOME="$(dirname "$(dirname "$_java_bin")")"
+            log_info "自动检测 JAVA_HOME: $JAVA_HOME"
+        fi
+    fi
+
+    if [[ -z "${JAVA_HOME:-}" ]]; then
+        # 尝试常见安装路径
+        for candidate in /usr/lib/jvm/java-17-openjdk-amd64 /usr/lib/jvm/java-11-openjdk-amd64 /usr/lib/jvm/default-java; do
+            if [[ -d "$candidate" ]]; then
+                JAVA_HOME="$candidate"
+                log_info "自动检测 JAVA_HOME: $JAVA_HOME"
+                break
+            fi
+        done
+    fi
+
+    if [[ -n "${JAVA_HOME:-}" ]]; then
+        export JAVA_HOME
+    else
+        log_warn "未自动检测到 JAVA_HOME，JNI 头文件搜索可能失败"
+        log_warn "请安装 JDK: sudo apt install openjdk-17-jdk"
+        log_warn "或手动设置: export JAVA_HOME=/path/to/jdk"
+    fi
+fi
+
 # ── 检查 JNI 头文件 ─────────────────────────────────────────────────────
 check_jni_headers() {
-    # 检查常见 JNI 头文件路径
-    local jni_paths=(
+    # 检查常见 JNI 头文件路径（优先使用 JAVA_HOME）
+    local jni_paths=()
+
+    if [[ -n "${JAVA_HOME:-}" ]]; then
+        jni_paths+=("${JAVA_HOME}/include/jni.h")
+    fi
+
+    jni_paths+=(
         "/usr/lib/jvm/java-17-openjdk-amd64/include/jni.h"
         "/usr/lib/jvm/java-11-openjdk-amd64/include/jni.h"
         "/usr/lib/jvm/default-java/include/jni.h"

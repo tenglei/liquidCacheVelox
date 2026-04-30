@@ -15,12 +15,14 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+#if ARROW_VERSION_MAJOR >= 19
     auto init_status = arrow::compute::Initialize();
     if (!init_status.ok()) {
         std::cerr << "ERROR: Failed to initialize Arrow compute: "
                   << init_status.ToString() << "\n";
         return 1;
     }
+#endif
 
     std::string path = argv[1];
 
@@ -31,12 +33,21 @@ int main(int argc, char* argv[]) {
     }
     auto infile = maybe_infile.ValueOrDie();
 
+#if ARROW_VERSION_MAJOR >= 19
     auto reader_result = parquet::arrow::OpenFile(infile, arrow::default_memory_pool());
     if (!reader_result.ok()) {
         std::cerr << "Cannot read Parquet: " << reader_result.status().ToString() << "\n";
         return 1;
     }
     auto reader = std::move(reader_result).ValueOrDie();
+#else
+    std::unique_ptr<parquet::arrow::FileReader> reader;
+    auto open_status = parquet::arrow::OpenFile(infile, arrow::default_memory_pool(), &reader);
+    if (!open_status.ok()) {
+        std::cerr << "Cannot read Parquet: " << open_status.ToString() << "\n";
+        return 1;
+    }
+#endif
 
     auto meta = reader->parquet_reader()->metadata();
     std::shared_ptr<arrow::Schema> schema;
@@ -47,12 +58,20 @@ int main(int argc, char* argv[]) {
     }
 
     int64_t total_rows = 0;
+#if ARROW_VERSION_MAJOR >= 19
     auto rb_result = reader->GetRecordBatchReader();
     if (!rb_result.ok()) {
         std::cerr << "Cannot get batch reader: " << rb_result.status().ToString() << "\n";
         return 1;
     }
-    auto batch_reader = rb_result.MoveValueUnsafe();
+#else
+    std::shared_ptr<arrow::RecordBatchReader> batch_reader;
+    auto rb_status = reader->GetRecordBatchReader(&batch_reader);
+    if (!rb_status.ok()) {
+        std::cerr << "Cannot get batch reader: " << rb_status.ToString() << "\n";
+        return 1;
+    }
+#endif
 
     while (true) {
         std::shared_ptr<arrow::RecordBatch> batch;

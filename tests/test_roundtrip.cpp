@@ -107,6 +107,89 @@ TEST(RoundtripDate64, Basic) {
     test_primitive_roundtrip<arrow::Date64Type>(
         {0LL, 86400000LL, 1648000000000LL, -86400000LL});
 }
+TEST(RoundtripDate32, WithNulls) {
+    arrow::Date32Builder builder;
+    APPEND(builder, 0);
+    APPEND_NULL(builder);
+    APPEND(builder, 365);
+    APPEND_NULL(builder);
+    APPEND(builder, 19053);
+    auto array = builder.Finish().ValueOrDie();
+    auto liquid = LiquidPrimitiveArray<arrow::Date32Type>::from_arrow(array);
+    auto decoded = liquid.to_arrow();
+    assert_roundtrip(array, decoded);
+}
+TEST(RoundtripDate64, WithNulls) {
+    arrow::Date64Builder builder;
+    APPEND(builder, 0LL);
+    APPEND_NULL(builder);
+    APPEND(builder, 86400000LL);
+    APPEND_NULL(builder);
+    auto array = builder.Finish().ValueOrDie();
+    auto liquid = LiquidPrimitiveArray<arrow::Date64Type>::from_arrow(array);
+    auto decoded = liquid.to_arrow();
+    assert_roundtrip(array, decoded);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Timestamp type round-trip tests (was completely missing)
+// Timestamps are encoded as Int64 values internally
+// ═══════════════════════════════════════════════════════════════════════
+
+static std::shared_ptr<arrow::Array> make_timestamp(
+    arrow::TimeUnit::type unit,
+    const std::vector<int64_t>& values) {
+    auto type = arrow::timestamp(unit);
+    arrow::TimestampBuilder builder(type, arrow::default_memory_pool());
+    for (auto v : values) APPEND(builder, v);
+    return builder.Finish().ValueOrDie();
+}
+
+TEST(RoundtripTimestamp, Second) {
+    auto array = make_timestamp(arrow::TimeUnit::SECOND,
+        {0LL, 1LL, 1000LL, 1700000000LL, -1LL});
+    auto liquid = LiquidPrimitiveArray<arrow::TimestampType>::from_arrow(array);
+    auto decoded = liquid.to_arrow();
+    assert_roundtrip(array, decoded);
+}
+
+TEST(RoundtripTimestamp, Millisecond) {
+    auto array = make_timestamp(arrow::TimeUnit::MILLI,
+        {0LL, 1LL, 1000LL, 1700000000000LL, -86400000LL});
+    auto liquid = LiquidPrimitiveArray<arrow::TimestampType>::from_arrow(array);
+    auto decoded = liquid.to_arrow();
+    assert_roundtrip(array, decoded);
+}
+
+TEST(RoundtripTimestamp, Microsecond) {
+    auto array = make_timestamp(arrow::TimeUnit::MICRO,
+        {0LL, 1LL, 1000000LL, 1700000000000000LL});
+    auto liquid = LiquidPrimitiveArray<arrow::TimestampType>::from_arrow(array);
+    auto decoded = liquid.to_arrow();
+    assert_roundtrip(array, decoded);
+}
+
+TEST(RoundtripTimestamp, Nanosecond) {
+    auto array = make_timestamp(arrow::TimeUnit::NANO,
+        {0LL, 1LL, 1000000000LL, 1700000000000000000LL});
+    auto liquid = LiquidPrimitiveArray<arrow::TimestampType>::from_arrow(array);
+    auto decoded = liquid.to_arrow();
+    assert_roundtrip(array, decoded);
+}
+
+TEST(RoundtripTimestamp, WithNulls) {
+    auto type = arrow::timestamp(arrow::TimeUnit::MILLI);
+    arrow::TimestampBuilder builder(type, arrow::default_memory_pool());
+    APPEND(builder, 1000000LL);
+    APPEND_NULL(builder);
+    APPEND(builder, 2000000LL);
+    APPEND_NULL(builder);
+    APPEND(builder, 3000000LL);
+    auto array = builder.Finish().ValueOrDie();
+    auto liquid = LiquidPrimitiveArray<arrow::TimestampType>::from_arrow(array);
+    auto decoded = liquid.to_arrow();
+    assert_roundtrip(array, decoded);
+}
 
 // ═══════════════════════════════════════════════════════════════════════
 // Null handling tests
@@ -226,6 +309,46 @@ TEST(RoundtripBinary, Basic) {
     assert_roundtrip(array, decoded);
 }
 
+TEST(RoundtripLargeString, Basic) {
+    arrow::LargeStringBuilder builder;
+    APPEND(builder, "hello");
+    APPEND(builder, "world");
+    APPEND(builder, "");
+    APPEND(builder, "a rather longer string for testing LargeString");
+    auto array = builder.Finish().ValueOrDie();
+
+    auto liquid = LiquidByteViewArray::from_arrow(array);
+    auto decoded = liquid.to_arrow();
+    // LargeString is encoded/decoded as regular String
+    ASSERT_EQ(decoded->type_id(), arrow::Type::STRING);
+    ASSERT_EQ(decoded->length(), 4);
+    ASSERT_EQ(decoded->null_count(), 0);
+    auto dec_typed = std::static_pointer_cast<arrow::StringArray>(decoded);
+    ASSERT_EQ(dec_typed->GetString(0), "hello");
+    ASSERT_EQ(dec_typed->GetString(1), "world");
+    ASSERT_EQ(dec_typed->GetString(2), "");
+    ASSERT_EQ(dec_typed->GetString(3), "a rather longer string for testing LargeString");
+}
+
+TEST(RoundtripLargeBinary, Basic) {
+    arrow::LargeBinaryBuilder builder;
+    APPEND(builder, std::string("\x00\x01\x02\x03", 4));
+    APPEND(builder, "binary_large");
+    APPEND(builder, "");
+    auto array = builder.Finish().ValueOrDie();
+
+    auto liquid = LiquidByteViewArray::from_arrow(array);
+    auto decoded = liquid.to_arrow();
+    // LargeBinary is encoded/decoded as regular Binary
+    ASSERT_EQ(decoded->type_id(), arrow::Type::BINARY);
+    ASSERT_EQ(decoded->length(), 3);
+    ASSERT_EQ(decoded->null_count(), 0);
+    auto dec_typed = std::static_pointer_cast<arrow::BinaryArray>(decoded);
+    ASSERT_EQ(dec_typed->GetString(0), std::string("\x00\x01\x02\x03", 4));
+    ASSERT_EQ(dec_typed->GetString(1), "binary_large");
+    ASSERT_EQ(dec_typed->GetString(2), "");
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Decimal128 round-trip tests (fits-u64 path)
 // ═══════════════════════════════════════════════════════════════════════
@@ -323,6 +446,66 @@ TEST(RoundtripDecimal256, LargeValues) {
     assert_roundtrip(array, decoded);
 }
 
+TEST(RoundtripDecimal128, NegativeValues) {
+    auto type = arrow::decimal128(10, 2);
+    arrow::Decimal128Builder builder(type);
+    APPEND(builder, arrow::Decimal128(-100));
+    APPEND(builder, arrow::Decimal128(0));
+    APPEND(builder, arrow::Decimal128(100));
+    APPEND(builder, arrow::Decimal128(-99999999));
+    auto array = builder.Finish().ValueOrDie();
+
+    // Negative values don't fit in u64, use fixed-length path
+    auto liquid = LiquidFixedLenByteArray::from_decimal128(array);
+    auto decoded = liquid.to_arrow();
+    assert_roundtrip(array, decoded);
+}
+
+TEST(RoundtripDecimal128, MaxPrecisionBoundary) {
+    auto type = arrow::decimal128(38, 0);
+    arrow::Decimal128Builder builder(type);
+    APPEND(builder, arrow::Decimal128("99999999999999999999999999999999999999"));
+    APPEND(builder, arrow::Decimal128("0"));
+    APPEND(builder, arrow::Decimal128("1"));
+    auto array = builder.Finish().ValueOrDie();
+
+    auto liquid = LiquidFixedLenByteArray::from_decimal128(array);
+    auto decoded = liquid.to_arrow();
+    assert_roundtrip(array, decoded);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// ALP float encoding edge case tests
+// ═══════════════════════════════════════════════════════════════════════
+
+TEST(RoundtripFloat64, RandomLargeArray) {
+    // Large random array to stress-test ALP encoding accuracy
+    arrow::DoubleBuilder builder;
+    for (int i = 0; i < 10000; ++i) {
+        double v = static_cast<double>(i) * 1.23456789 + 0.5;
+        APPEND(builder, v);
+    }
+    auto array = builder.Finish().ValueOrDie();
+
+    auto liquid = LiquidFloatArray<double>::from_arrow(array);
+    auto decoded = liquid.to_arrow();
+    // ALP is lossless - every value must match exactly
+    assert_roundtrip(array, decoded);
+}
+
+TEST(RoundtripFloat32, RandomLargeArray) {
+    arrow::FloatBuilder builder;
+    for (int i = 0; i < 10000; ++i) {
+        float v = static_cast<float>(i) * 0.12345f + 0.5f;
+        APPEND(builder, v);
+    }
+    auto array = builder.Finish().ValueOrDie();
+
+    auto liquid = LiquidFloatArray<float>::from_arrow(array);
+    auto decoded = liquid.to_arrow();
+    assert_roundtrip(array, decoded);
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Transcoder-level round-trip tests (full encode/decode pipeline)
 // ═══════════════════════════════════════════════════════════════════════
@@ -396,6 +579,21 @@ TEST(TranscodeRoundtrip, Decimal128Large) {
     assert_roundtrip(array, decoded);
 }
 
+TEST(TranscodeRoundtrip, TimestampArray) {
+    auto type = arrow::timestamp(arrow::TimeUnit::MICRO);
+    arrow::TimestampBuilder builder(type, arrow::default_memory_pool());
+    for (int i = 0; i < 50; ++i) {
+        APPEND(builder, static_cast<int64_t>(i) * 1000000LL);
+    }
+    auto array = builder.Finish().ValueOrDie();
+
+    auto encoded = transcode_arrow_array(array);
+    EXPECT_TRUE(encoded.is_valid());
+    auto decoded = decode_liquid_array(encoded);
+    ASSERT_NE(decoded, nullptr);
+    assert_roundtrip(array, decoded);
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Edge case tests
 // ═══════════════════════════════════════════════════════════════════════
@@ -415,6 +613,26 @@ TEST(RoundtripEdge, SingleElement) {
     auto array = builder.Finish().ValueOrDie();
 
     auto liquid = LiquidPrimitiveArray<arrow::Int64Type>::from_arrow(array);
+    auto decoded = liquid.to_arrow();
+    assert_roundtrip(array, decoded);
+}
+
+TEST(RoundtripEdge, SingleElementFloat) {
+    arrow::DoubleBuilder builder;
+    APPEND(builder, 3.14159);
+    auto array = builder.Finish().ValueOrDie();
+
+    auto liquid = LiquidFloatArray<double>::from_arrow(array);
+    auto decoded = liquid.to_arrow();
+    assert_roundtrip(array, decoded);
+}
+
+TEST(RoundtripEdge, SingleElementString) {
+    arrow::StringBuilder builder;
+    APPEND(builder, "solo");
+    auto array = builder.Finish().ValueOrDie();
+
+    auto liquid = LiquidByteViewArray::from_arrow(array);
     auto decoded = liquid.to_arrow();
     assert_roundtrip(array, decoded);
 }
@@ -527,12 +745,7 @@ TEST(Compression, StringSmallerThanOriginal) {
 class ArrowEnvironment : public ::testing::Environment {
 public:
     void SetUp() override {
-        // Register Arrow compute kernels (required for static linking)
-        auto status = arrow::compute::Initialize();
-        if (!status.ok()) {
-            fprintf(stderr, "Failed to initialize Arrow compute: %s\n",
-                    status.ToString().c_str());
-        }
+        // Compute kernels are auto-loaded via static initializers with --whole-archive
     }
 };
 

@@ -101,6 +101,16 @@ template <> struct ArrowPhysicalType<arrow::TimestampType> { static constexpr Ph
 //   [BitPackedArray serialized data]
 // ═══════════════════════════════════════════════════════════════════════
 
+// Type trait: check if ArrowType has TypeTraits<T>::type_singleton().
+// TimestampType needs a time unit parameter, so it does NOT.
+template <typename, typename = void>
+struct has_arrow_type_singleton : std::false_type {};
+
+template <typename T>
+struct has_arrow_type_singleton<T,
+    std::void_t<decltype(arrow::TypeTraits<T>::type_singleton())>
+> : std::true_type {};
+
 template <typename ArrowType>
 class LiquidPrimitiveArray {
 public:
@@ -170,6 +180,8 @@ public:
 
         result.bit_packed_ = BitPackedArray(offsets.data(), null_bitmap,
                                              static_cast<uint32_t>(len), bw);
+        // Store original Arrow type for TimestampType etc. which need unit info
+        result.type_ = array->type();
         return result;
     }
 
@@ -177,9 +189,14 @@ public:
     /// Optimized: bulk unpack + ArrayData::Make (no per-element Builder).
     std::shared_ptr<arrow::Array> to_arrow() const {
         uint32_t len = bit_packed_.length();
+        std::shared_ptr<arrow::DataType> arrow_type;
+        if (type_) {
+            arrow_type = type_;
+        } else if constexpr (has_arrow_type_singleton<ArrowType>::value) {
+            arrow_type = arrow::TypeTraits<ArrowType>::type_singleton();
+        }
         if (len == 0) {
-            return arrow::MakeEmptyArray(
-                arrow::TypeTraits<ArrowType>::type_singleton()).ValueOrDie();
+            return arrow::MakeEmptyArray(arrow_type).ValueOrDie();
         }
 
         // Step 1: Allocate Arrow value buffer
@@ -198,7 +215,7 @@ public:
         auto null_buf = bit_packed_.null_bitmap_arrow_buffer();
         int64_t nc = bit_packed_.null_count();
         auto data = arrow::ArrayData::Make(
-            arrow::TypeTraits<ArrowType>::type_singleton(),
+            arrow_type,
             static_cast<int64_t>(len),
             {std::move(null_buf), std::move(value_buf)},
             nc);
@@ -261,6 +278,7 @@ public:
 private:
     NativeT reference_value_ = 0;
     BitPackedArray bit_packed_;
+    std::shared_ptr<arrow::DataType> type_;
 };
 
 // Common type aliases (matching Rust)

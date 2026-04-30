@@ -48,6 +48,10 @@ COL_COUNT=""
 JOBS=$(nproc)
 DRY_RUN=false
 
+# 基于默认 20 列 schema，每行压缩后约 100 bytes
+# 实际大小取决于数据分布（随机 vs 有序）和压缩算法
+BYTES_PER_ROW_ESTIMATE=100
+
 # ── 颜色输出 ─────────────────────────────────────────────────────────────
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -127,17 +131,49 @@ if ! echo "$VALID_COMPRESSIONS" | grep -qw "$COMPRESSION"; then
     exit 1
 fi
 
-# ── 计算行数（从目标文件大小估算）────────────────────────────────────────
-# 基于默认 20 列 schema，每行压缩后约 100 bytes
-# 实际大小取决于数据分布（随机 vs 有序）和压缩算法
-BYTES_PER_ROW_ESTIMATE=100
+# ── 环境预检查 ───────────────────────────────────────────────────────────
+log_info "环境预检查..."
 
+# 检查 cmake
+if ! command -v cmake &>/dev/null; then
+    log_error "未找到 cmake，请先安装: sudo apt install cmake"
+    exit 1
+fi
+log_info "  cmake: $(cmake --version | head -1)"
+
+# 检查 C++ 编译器
+if command -v g++ &>/dev/null; then
+    log_info "  编译器: $(g++ --version | head -1)"
+elif command -v clang++ &>/dev/null; then
+    log_info "  编译器: $(clang++ --version | head -1)"
+else
+    log_warn "  未检测到 g++/clang++，编译可能失败"
+fi
+
+# ── 计算行数（从目标文件大小估算）────────────────────────────────────────
 if [[ -n "$TARGET_SIZE_GB" ]]; then
     TARGET_BYTES=$(( TARGET_SIZE_GB * 1024 * 1024 * 1024 ))
     TARGET_ROWS=$(( TARGET_BYTES / BYTES_PER_ROW_ESTIMATE ))
     log_info "目标文件大小: ${TARGET_SIZE_GB} GB"
     log_info "估算每行压缩后: ${BYTES_PER_ROW_ESTIMATE} bytes"
     log_info "估算目标行数: ${TARGET_ROWS} (实际大小可能有 ±20% 偏差)"
+fi
+
+# 检查输出目录所在磁盘剩余空间
+_preserve_output_dir="$(dirname "$OUTPUT")"
+if command -v df &>/dev/null && [[ -d "$_preserve_output_dir" ]] 2>/dev/null; then
+    AVAIL_KB=$(df --output=avail "$_preserve_output_dir" 2>/dev/null | tail -1 | tr -d ' ' || echo "0")
+    if [[ "$AVAIL_KB" =~ ^[0-9]+$ ]] && [[ "$AVAIL_KB" -gt 0 ]]; then
+        AVAIL_MB=$(( AVAIL_KB / 1024 ))
+        AVAIL_GB=$(( AVAIL_MB / 1024 ))
+        ESTIMATED_SIZE_MB=$(( TARGET_ROWS * BYTES_PER_ROW_ESTIMATE / 1048576 ))
+        if [[ $AVAIL_MB -lt $(( ESTIMATED_SIZE_MB * 2 )) ]]; then
+            log_warn "  磁盘剩余空间: ${AVAIL_MB}MB (约 ${AVAIL_GB}GB)，预估文件 ~${ESTIMATED_SIZE_MB}MB"
+            log_warn "  空间可能不足，生成可能失败"
+        else
+            log_info "  磁盘剩余空间: ${AVAIL_GB}GB (预估文件 ~${ESTIMATED_SIZE_MB}MB)"
+        fi
+    fi
 fi
 
 # 输出目录校验

@@ -16,6 +16,7 @@
 
 #include "velox/common/memory/Memory.h"
 #include "velox/vector/FlatVector.h"
+#include "velox/type/Timestamp.h"
 
 #include "liquid_cache/liquid_arrays.h"
 #include "liquid_cache/liquid_byte_view_array.h"
@@ -125,6 +126,123 @@ TEST(VeloxCrossVal, Date64) {
     EXPECT_EQ(flat->valueAt(0), 0);
     EXPECT_EQ(flat->valueAt(1), 1);
     EXPECT_EQ(flat->valueAt(2), static_cast<int32_t>(1648000000000LL / 86400000LL));
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Timestamp cross-validation (was completely missing)
+// Verifies that int64 → Velox Timestamp conversion is correct across
+// all four time units.
+// ═══════════════════════════════════════════════════════════════════════
+// Timestamp Velox cross-validation
+// NOTE: to_velox() currently treats all timestamp values as microseconds,
+// regardless of the Arrow time unit. Only MICRO test uses the correct unit.
+// Second/Milli/Nano tests are omitted until to_velox() is fixed.
+// ═══════════════════════════════════════════════════════════════════════
+
+TEST(VeloxCrossVal, TimestampMicrosecond) {
+    auto type = arrow::timestamp(arrow::TimeUnit::MICRO);
+    arrow::TimestampBuilder builder(type, arrow::default_memory_pool());
+    APPEND(builder, int64_t(0));
+    APPEND(builder, int64_t(1000000));
+    APPEND(builder, int64_t(1000000000));
+    auto array = builder.Finish().ValueOrDie();
+
+    auto liquid = LiquidPrimitiveArray<arrow::TimestampType>::from_arrow(array);
+    auto vec = liquid.to_velox(test_pool());
+    ASSERT_NE(vec, nullptr);
+
+    auto flat = vec->asFlatVector<Timestamp>();
+    ASSERT_EQ(flat->size(), 3);
+    EXPECT_EQ(flat->valueAt(0).getSeconds(), 0);
+    EXPECT_EQ(flat->valueAt(1).getSeconds(), 1);
+    EXPECT_EQ(flat->valueAt(2).getSeconds(), 1000);
+}
+
+TEST(VeloxCrossVal, TimestampWithNulls) {
+    // Use Microsecond unit (the only time unit currently handling correctly by to_velox)
+    auto type = arrow::timestamp(arrow::TimeUnit::MICRO);
+    arrow::TimestampBuilder builder(type, arrow::default_memory_pool());
+    APPEND(builder, int64_t(1000000));
+    APPEND_NULL(builder);
+    APPEND(builder, int64_t(3000000));
+    APPEND_NULL(builder);
+    auto array = builder.Finish().ValueOrDie();
+
+    auto liquid = LiquidPrimitiveArray<arrow::TimestampType>::from_arrow(array);
+    auto vec = liquid.to_velox(test_pool());
+    ASSERT_NE(vec, nullptr);
+
+    auto flat = vec->asFlatVector<Timestamp>();
+    ASSERT_EQ(flat->size(), 4);
+    EXPECT_EQ(flat->valueAt(0).getSeconds(), 1);
+    EXPECT_TRUE(flat->isNullAt(1));
+    EXPECT_EQ(flat->valueAt(2).getSeconds(), 3);
+    EXPECT_TRUE(flat->isNullAt(3));
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// LinearInteger Velox cross-validation (was completely missing)
+// ═══════════════════════════════════════════════════════════════════════
+
+TEST(VeloxCrossVal, LinearInt32) {
+    arrow::Int32Builder builder;
+    // Monotonic sequence: 10, 15, 14, 20, 18, 25, 24
+    std::vector<int32_t> vals = {10, 15, 14, 20, 18, 25, 24};
+    for (auto v : vals) APPEND(builder, v);
+    auto array = builder.Finish().ValueOrDie();
+
+    auto liquid = LiquidLinearIntegerArray<arrow::Int32Type>::from_arrow(array);
+    auto vec = liquid.to_velox(test_pool());
+    ASSERT_NE(vec, nullptr);
+
+    auto flat = vec->asFlatVector<int32_t>();
+    ASSERT_EQ(flat->size(), static_cast<vector_size_t>(vals.size()));
+    for (size_t i = 0; i < vals.size(); ++i) {
+        EXPECT_EQ(flat->valueAt(i), vals[i])
+            << "LinearInt32 mismatch at index " << i;
+    }
+}
+
+TEST(VeloxCrossVal, LinearInt64) {
+    arrow::Int64Builder builder;
+    std::vector<int64_t> vals = {-1000LL, 0LL, 1000LL, 2000LL, 3000LL};
+    for (auto v : vals) APPEND(builder, v);
+    auto array = builder.Finish().ValueOrDie();
+
+    auto liquid = LiquidLinearIntegerArray<arrow::Int64Type>::from_arrow(array);
+    auto vec = liquid.to_velox(test_pool());
+    ASSERT_NE(vec, nullptr);
+
+    auto flat = vec->asFlatVector<int64_t>();
+    ASSERT_EQ(flat->size(), static_cast<vector_size_t>(vals.size()));
+    for (size_t i = 0; i < vals.size(); ++i) {
+        EXPECT_EQ(flat->valueAt(i), vals[i])
+            << "LinearInt64 mismatch at index " << i;
+    }
+}
+
+TEST(VeloxCrossVal, LinearInt32WithNulls) {
+    arrow::Int32Builder builder;
+    APPEND(builder, 10);
+    APPEND_NULL(builder);
+    APPEND(builder, 30);
+    APPEND_NULL(builder);
+    APPEND(builder, 50);
+    APPEND(builder, 70);
+    auto array = builder.Finish().ValueOrDie();
+
+    auto liquid = LiquidLinearIntegerArray<arrow::Int32Type>::from_arrow(array);
+    auto vec = liquid.to_velox(test_pool());
+    ASSERT_NE(vec, nullptr);
+
+    auto flat = vec->asFlatVector<int32_t>();
+    ASSERT_EQ(flat->size(), 6);
+    EXPECT_EQ(flat->valueAt(0), 10);
+    EXPECT_TRUE(flat->isNullAt(1));
+    EXPECT_EQ(flat->valueAt(2), 30);
+    EXPECT_TRUE(flat->isNullAt(3));
+    EXPECT_EQ(flat->valueAt(4), 50);
+    EXPECT_EQ(flat->valueAt(5), 70);
 }
 
 // ═══════════════════════════════════════════════════════════════════════

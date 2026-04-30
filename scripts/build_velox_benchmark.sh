@@ -31,9 +31,7 @@ set -euo pipefail
 # ── 默认值 ───────────────────────────────────────────────────────────────
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${PROJECT_ROOT}/build"
-# 已验证可用的默认 Velox 路径
-VELOX_PREFIX_DEFAULT="/home/tenglei/code/velox/build"
-VELOX_PREFIX="${VELOX_PREFIX_DEFAULT}"
+VELOX_PREFIX=""  # 自动检测，也可通过 -p 或 $VELOX_PREFIX 环境变量指定
 BUILD_TYPE="Release"
 JOBS=$(nproc)
 DO_CLEAN=false
@@ -93,6 +91,67 @@ fi
 if [[ ! "$JOBS" =~ ^[0-9]+$ ]] || [[ "$JOBS" -eq 0 ]]; then
     log_error "-j 必须为正整数，得到: $JOBS"
     exit 1
+fi
+
+# ── 自动检测 VELOX_PREFIX ──────────────────────────────────────────────
+if [[ -z "$VELOX_PREFIX" ]]; then
+    log_info "未指定 --velox-prefix，尝试自动检测 Velox 构建目录..."
+
+    # 1) 检查环境变量
+    if [[ -n "${VELOX_PREFIX:-}" ]] && [[ -d "$VELOX_PREFIX" ]]; then
+        VELOX_PREFIX="$VELOX_PREFIX"
+        log_info "  从环境变量 \$VELOX_PREFIX 检测到: $VELOX_PREFIX"
+    fi
+
+    # 2) 搜索常见路径
+    if [[ -z "$VELOX_PREFIX" ]]; then
+        _search_paths=()
+        for d in /home/*/code/velox/build /opt/velox/build "$HOME/code/velox/build" /usr/local/velox/build; do
+            [[ -d "$d" ]] && _search_paths+=("$d")
+        done
+
+        if [[ ${#_search_paths[@]} -gt 0 ]]; then
+            VELOX_PREFIX="${_search_paths[0]}"
+            if [[ ${#_search_paths[@]} -gt 1 ]]; then
+                log_info "  找到多个候选路径，使用第一个: $VELOX_PREFIX"
+                for p in "${_search_paths[@]}"; do
+                    log_info "    - $p"
+                done
+            else
+                log_info "  自动检测到: $VELOX_PREFIX"
+            fi
+        fi
+    fi
+
+    # 3) 未找到
+    if [[ -z "$VELOX_PREFIX" ]]; then
+        log_error "无法自动检测 Velox 构建目录"
+        log_error ""
+        log_error "请通过以下方式之一指定:"
+        log_error "  1. 命令行:    $0 -p /path/to/velox/build"
+        log_error "  2. 环境变量:  export VELOX_PREFIX=/path/to/velox/build"
+        log_error "  3. 确保 Velox 已构建在以下路径之一:"
+        log_error "     /home/<user>/code/velox/build"
+        log_error "     /opt/velox/build"
+        log_error "     ~/code/velox/build"
+        exit 1
+    fi
+fi
+
+# ── 环境预检查 ───────────────────────────────────────────────────────────
+log_info "环境预检查..."
+if ! command -v cmake &>/dev/null; then
+    log_error "未找到 cmake，请先安装: sudo apt install cmake"
+    exit 1
+fi
+log_info "  cmake: $(cmake --version | head -1)"
+
+if command -v g++ &>/dev/null; then
+    log_info "  编译器: $(g++ --version | head -1)"
+elif command -v clang++ &>/dev/null; then
+    log_info "  编译器: $(clang++ --version | head -1)"
+else
+    log_warn "  未检测到 g++/clang++，编译可能失败"
 fi
 
 # ── Velox 路径校验 ───────────────────────────────────────────────────────
