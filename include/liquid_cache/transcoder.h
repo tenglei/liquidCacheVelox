@@ -52,7 +52,7 @@ inline PhysicalType physical_type_from_arrow(int arrow_type_id) {
         case 12: return PhysicalType::Float64;   // arrow::Type::DOUBLE
         case 16: return PhysicalType::Date32;    // arrow::Type::DATE32
         case 17: return PhysicalType::Date64;    // arrow::Type::DATE64
-        // Timestamps require additional handling for unit/timezone
+        case 18: return PhysicalType::TimestampMicrosecond;  // arrow::Type::TIMESTAMP (default unit)
         default: return static_cast<PhysicalType>(0xFFFF);
     }
 }

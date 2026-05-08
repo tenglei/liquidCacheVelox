@@ -828,8 +828,8 @@ public:
 
         result.bit_packed_ = BitPackedArray(offsets.data(), null_bitmap,
                                              static_cast<uint32_t>(len), bw);
-        return result;
         result.squeeze_policy_ = FloatSqueezePolicy::Quantize;
+        return result;
     }
 
     /// Decode back to an Arrow array.
