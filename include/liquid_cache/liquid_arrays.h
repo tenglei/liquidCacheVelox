@@ -1002,21 +1002,30 @@ public:
 
 private:
     /// Find the best ALP exponents by exhaustive search.
+    /// Matches Rust LiquidFloatArray::get_best_exponents: samples values
+    /// for large arrays, then evaluates all (e, f) pairs over the sample.
     static Exponents find_best_exponents(
             const std::shared_ptr<typename arrow::TypeTraits<ArrowType>::ArrayType>& arr) {
         Exponents best{0, 0};
         size_t min_size = std::numeric_limits<size_t>::max();
         const int64_t len = arr->length();
 
-        // Sample for large arrays
+        // Collect non-null values for exponent evaluation.
+        // For len <= 1024: collect all non-null values.
+        // For len > 1024: collect a uniform sample of up to ~1024 non-null values.
         std::vector<FloatT> sample;
         if (len > 1024) {
-            size_t step = len / 1024;
-            for (int64_t i = 0; i < len; i += step) {
+            size_t step = std::max<size_t>(len / 1024, 1);
+            for (int64_t i = 0; i < len; i += static_cast<int64_t>(step)) {
+                if (!arr->IsNull(i)) sample.push_back(arr->Value(i));
+            }
+        } else {
+            for (int64_t i = 0; i < len; ++i) {
                 if (!arr->IsNull(i)) sample.push_back(arr->Value(i));
             }
         }
 
+        // Evaluate each (e, f) pair over the collected sample
         for (uint8_t e = 0; e < Traits::MAX_EXPONENT; ++e) {
             for (uint8_t f = 0; f < e; ++f) {
                 Exponents exp{e, f};
@@ -1024,10 +1033,7 @@ private:
                 SignedInt min_enc = std::numeric_limits<SignedInt>::max();
                 SignedInt max_enc = std::numeric_limits<SignedInt>::min();
 
-                auto& source = sample.empty() ? *arr : *arr;  // use full for small
-                for (int64_t i = 0; i < len; i += (len > 1024 ? len / 1024 : 1)) {
-                    if (arr->IsNull(i)) continue;
-                    FloatT v = arr->Value(i);
+                for (FloatT v : sample) {
                     SignedInt enc = encode_single(v, exp);
                     FloatT dec = decode_single(enc, exp);
                     if (dec != v) ++patches;
@@ -1037,8 +1043,10 @@ private:
 
                 UnsignedInt range = static_cast<UnsignedInt>(max_enc - min_enc);
                 uint8_t bw = get_bit_width(static_cast<uint64_t>(range));
+                // Estimate is scaled to full length for fair comparison
                 size_t est_size = (static_cast<size_t>(len) * bw + 7) / 8 +
-                                  patches * (8 + sizeof(FloatT));
+                                  static_cast<size_t>(static_cast<double>(patches) / sample.size() * len) *
+                                  (8 + sizeof(FloatT));
                 if (est_size < min_size) {
                     min_size = est_size;
                     best = exp;

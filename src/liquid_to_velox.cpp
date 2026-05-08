@@ -29,13 +29,30 @@ VectorPtr LiquidPrimitiveArray<ArrowType>::to_velox(
     using UnsignedT = typename UnsignedType<ArrowType>::type;
 
     uint32_t len = bit_packed_.length();
-    if (len == 0) {
-        return BaseVector::create(
-            liquid_physical_to_velox_type(ArrowPhysicalType<ArrowType>::value),
-            0, pool);
+
+    // Timestamps are stored as LiquidPrimitiveArray<Int64Type>.
+    // The template parameter ArrowType is always arrow::Int64Type here,
+    // so ArrowPhysicalType<ArrowType>::value always returns Int64.
+    // We must check the stored type_ field (populated from the original
+    // Arrow TimestampType) to determine the actual time unit and produce
+    // a Velox TIMESTAMP vector rather than BIGINT.
+    auto pt = ArrowPhysicalType<ArrowType>::value;
+    if (type_ && type_->id() == arrow::Type::TIMESTAMP) {
+        auto ts_type = std::static_pointer_cast<arrow::TimestampType>(type_);
+        switch (ts_type->unit()) {
+            case arrow::TimeUnit::SECOND: pt = PhysicalType::TimestampSecond; break;
+            case arrow::TimeUnit::MILLI:  pt = PhysicalType::TimestampMillisecond; break;
+            case arrow::TimeUnit::MICRO:  pt = PhysicalType::TimestampMicrosecond; break;
+            case arrow::TimeUnit::NANO:   pt = PhysicalType::TimestampNanosecond; break;
+            default: break;
+        }
     }
 
-    auto pt = ArrowPhysicalType<ArrowType>::value;
+    if (len == 0) {
+        return BaseVector::create(
+            liquid_physical_to_velox_type(pt), 0, pool);
+    }
+
     auto nulls = copy_null_bitmap_to_velox(bit_packed_, pool);
 
     // --- Timestamp types: special handling ---
@@ -538,10 +555,6 @@ RowTypePtr arrow_schema_to_velox_row_type(
 //
 // Wrapper that hides Arrow types from callers.
 // ═══════════════════════════════════════════════════════════════════════
-
-// Forward declaration — defined in transcoder_arrow.cpp
-extern LiquidArrayRef transcode_to_liquid_array(
-    const std::shared_ptr<arrow::Array>& array);
 
 std::vector<LiquidCacheStore::RowGroupInfo>
 LiquidCacheStore::load_from_parquet_for_velox(

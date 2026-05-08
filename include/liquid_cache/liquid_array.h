@@ -155,4 +155,10 @@ LiquidArrayRef make_liquid_array(LiquidArrayT inner,
         std::move(inner), dt, pt, std::move(original_type));
 }
 
+/// Transcode an Arrow array into an in-memory LiquidArrayRef.
+/// Defined in transcoder_arrow.cpp. Returns nullptr for unsupported types.
+/// This is the key entry point for the arrow → liquid → velox pipeline.
+LiquidArrayRef transcode_to_liquid_array(
+    const std::shared_ptr<arrow::Array>& array);
+
 }  // namespace liquid_cache

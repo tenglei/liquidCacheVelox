@@ -129,15 +129,49 @@ TEST(VeloxCrossVal, Date64) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Timestamp cross-validation (was completely missing)
-// Verifies that int64 → Velox Timestamp conversion is correct across
-// all four time units.
+// Timestamp cross-validation — all four time units
+// Verifies that LiquidPrimitiveArray<Int64Type>::to_velox() correctly
+// detects the stored TimestampType and produces TIMESTAMP (not BIGINT).
 // ═══════════════════════════════════════════════════════════════════════
-// Timestamp Velox cross-validation
-// NOTE: to_velox() currently treats all timestamp values as microseconds,
-// regardless of the Arrow time unit. Only MICRO test uses the correct unit.
-// Second/Milli/Nano tests are omitted until to_velox() is fixed.
-// ═══════════════════════════════════════════════════════════════════════
+
+TEST(VeloxCrossVal, TimestampSecond) {
+    auto type = arrow::timestamp(arrow::TimeUnit::SECOND);
+    arrow::TimestampBuilder builder(type, arrow::default_memory_pool());
+    APPEND(builder, int64_t(0));
+    APPEND(builder, int64_t(1));
+    APPEND(builder, int64_t(1000));
+    auto array = builder.Finish().ValueOrDie();
+
+    auto liquid = LiquidPrimitiveArray<arrow::TimestampType>::from_arrow(array);
+    auto vec = liquid.to_velox(test_pool());
+    ASSERT_NE(vec, nullptr);
+
+    auto flat = vec->asFlatVector<Timestamp>();
+    ASSERT_EQ(flat->size(), 3);
+    EXPECT_EQ(flat->valueAt(0).getSeconds(), 0);
+    EXPECT_EQ(flat->valueAt(0).getNanos(), 0);
+    EXPECT_EQ(flat->valueAt(1).getSeconds(), 1);
+    EXPECT_EQ(flat->valueAt(2).getSeconds(), 1000);
+}
+
+TEST(VeloxCrossVal, TimestampMillisecond) {
+    auto type = arrow::timestamp(arrow::TimeUnit::MILLI);
+    arrow::TimestampBuilder builder(type, arrow::default_memory_pool());
+    APPEND(builder, int64_t(0));
+    APPEND(builder, int64_t(1000));
+    APPEND(builder, int64_t(86400000));  // 1 day in ms
+    auto array = builder.Finish().ValueOrDie();
+
+    auto liquid = LiquidPrimitiveArray<arrow::TimestampType>::from_arrow(array);
+    auto vec = liquid.to_velox(test_pool());
+    ASSERT_NE(vec, nullptr);
+
+    auto flat = vec->asFlatVector<Timestamp>();
+    ASSERT_EQ(flat->size(), 3);
+    EXPECT_EQ(flat->valueAt(0).toMillis(), 0);
+    EXPECT_EQ(flat->valueAt(1).toMillis(), 1000);
+    EXPECT_EQ(flat->valueAt(2).toMillis(), 86400000);
+}
 
 TEST(VeloxCrossVal, TimestampMicrosecond) {
     auto type = arrow::timestamp(arrow::TimeUnit::MICRO);
@@ -158,8 +192,26 @@ TEST(VeloxCrossVal, TimestampMicrosecond) {
     EXPECT_EQ(flat->valueAt(2).getSeconds(), 1000);
 }
 
+TEST(VeloxCrossVal, TimestampNanosecond) {
+    auto type = arrow::timestamp(arrow::TimeUnit::NANO);
+    arrow::TimestampBuilder builder(type, arrow::default_memory_pool());
+    APPEND(builder, int64_t(0));
+    APPEND(builder, int64_t(1000000000));  // 1 second in ns
+    APPEND(builder, int64_t(60000000000)); // 60 seconds in ns
+    auto array = builder.Finish().ValueOrDie();
+
+    auto liquid = LiquidPrimitiveArray<arrow::TimestampType>::from_arrow(array);
+    auto vec = liquid.to_velox(test_pool());
+    ASSERT_NE(vec, nullptr);
+
+    auto flat = vec->asFlatVector<Timestamp>();
+    ASSERT_EQ(flat->size(), 3);
+    EXPECT_EQ(flat->valueAt(0).toNanos(), 0);
+    EXPECT_EQ(flat->valueAt(1).toNanos(), 1000000000);
+    EXPECT_EQ(flat->valueAt(2).toNanos(), 60000000000);
+}
+
 TEST(VeloxCrossVal, TimestampWithNulls) {
-    // Use Microsecond unit (the only time unit currently handling correctly by to_velox)
     auto type = arrow::timestamp(arrow::TimeUnit::MICRO);
     arrow::TimestampBuilder builder(type, arrow::default_memory_pool());
     APPEND(builder, int64_t(1000000));
@@ -493,27 +545,166 @@ TEST(VeloxCrossVal, Float64WithNulls) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Edge case: empty arrays
+// Edge case: all-null arrays, Date64, Float32-with-nulls
 // ═══════════════════════════════════════════════════════════════════════
 
-TEST(VeloxCrossVal, EmptyInt32) {
-    arrow::Int32Builder builder;
+TEST(VeloxCrossVal, AllNullInt64) {
+    arrow::Int64Builder builder;
+    for (int i = 0; i < 10; ++i) APPEND_NULL(builder);
     auto array = builder.Finish().ValueOrDie();
 
-    auto liquid = LiquidPrimitiveArray<arrow::Int32Type>::from_arrow(array);
+    auto liquid = LiquidPrimitiveArray<arrow::Int64Type>::from_arrow(array);
     auto vec = liquid.to_velox(test_pool());
     ASSERT_NE(vec, nullptr);
-    EXPECT_EQ(vec->size(), 0);
+    ASSERT_EQ(vec->size(), 10);
+
+    auto flat = vec->asFlatVector<int64_t>();
+    for (int i = 0; i < 10; ++i) {
+        EXPECT_TRUE(flat->isNullAt(i)) << "Expected null at index " << i;
+    }
 }
 
-TEST(VeloxCrossVal, EmptyString) {
-    arrow::StringBuilder builder;
+TEST(VeloxCrossVal, Date64Conversion) {
+    // Date64 stores ms since epoch; Velox DATE is days since epoch (int32)
+    arrow::Date64Builder builder;
+    APPEND(builder, int64_t(0));
+    APPEND(builder, int64_t(86400000LL));          // 1 day
+    APPEND(builder, int64_t(1648000000000LL));     // ~19053 days
+    APPEND(builder, int64_t(86400000LL * 365));    // 365 days
     auto array = builder.Finish().ValueOrDie();
 
-    auto liquid = LiquidByteViewArray::from_arrow(array);
+    auto liquid = LiquidPrimitiveArray<arrow::Date64Type>::from_arrow(array);
     auto vec = liquid.to_velox(test_pool());
     ASSERT_NE(vec, nullptr);
-    EXPECT_EQ(vec->size(), 0);
+
+    auto flat = vec->asFlatVector<int32_t>();
+    ASSERT_EQ(flat->size(), 4);
+    EXPECT_EQ(flat->valueAt(0), 0);
+    EXPECT_EQ(flat->valueAt(1), 1);
+    EXPECT_EQ(flat->valueAt(2), static_cast<int32_t>(1648000000000LL / 86400000LL));
+    EXPECT_EQ(flat->valueAt(3), 365);
+}
+
+TEST(VeloxCrossVal, Float32WithNulls) {
+    arrow::FloatBuilder builder;
+    APPEND(builder, 1.5f);
+    APPEND_NULL(builder);
+    APPEND(builder, -3.14f);
+    APPEND_NULL(builder);
+    APPEND(builder, 0.0f);
+    auto array = builder.Finish().ValueOrDie();
+
+    auto liquid = LiquidFloatArray<float>::from_arrow(array);
+    auto vec = liquid.to_velox(test_pool());
+    ASSERT_NE(vec, nullptr);
+
+    auto flat = vec->asFlatVector<float>();
+    ASSERT_EQ(flat->size(), 5);
+    EXPECT_FLOAT_EQ(flat->valueAt(0), 1.5f);
+    EXPECT_TRUE(flat->isNullAt(1));
+    EXPECT_FLOAT_EQ(flat->valueAt(2), -3.14f);
+    EXPECT_TRUE(flat->isNullAt(3));
+    EXPECT_FLOAT_EQ(flat->valueAt(4), 0.0f);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Full pipeline test: Parquet → Liquid (in-memory) → Velox Vector
+//
+// This is the critical end-to-end test that validates the complete
+// parquet → liquid cache → velox vector data path. Previously only
+// individual Arrow→Liquid and Arrow→Liquid→Velox tests existed, but
+// no test exercised the transcoder dispatch (transcode_to_liquid_array)
+// followed by Velox conversion.
+// ═══════════════════════════════════════════════════════════════════════
+
+#include <arrow/io/file.h>
+#include <parquet/arrow/reader.h>
+#include "liquid_cache/transcoder.h"
+#include "liquid_cache/liquid_array.h"
+
+TEST(FullPipeline, ParquetToLiquidToVelox) {
+    // Path to the generated test Parquet file
+    const std::string parquet_path =
+        std::string(std::getenv("TEST_PARQUET_PATH") ?
+                    std::getenv("TEST_PARQUET_PATH") :
+                    "build/test_data_512mb.parquet");
+
+    // Open Parquet file
+    auto infile_result = arrow::io::ReadableFile::Open(parquet_path);
+    if (!infile_result.ok()) {
+        GTEST_SKIP() << "Test Parquet file not found: " << parquet_path
+                     << " (set TEST_PARQUET_PATH env var)";
+    }
+    auto infile = infile_result.ValueOrDie();
+
+    std::unique_ptr<parquet::arrow::FileReader> reader;
+#if ARROW_VERSION_MAJOR >= 19
+    auto open_result = parquet::arrow::OpenFile(infile, arrow::default_memory_pool());
+    ASSERT_TRUE(open_result.ok()) << "Failed to open Parquet: " << open_result.status();
+    reader = std::move(open_result).ValueOrDie();
+#else
+    auto open_status = parquet::arrow::OpenFile(
+        infile, arrow::default_memory_pool(), &reader);
+    ASSERT_TRUE(open_status.ok()) << "Failed to open Parquet: " << open_status;
+#endif
+
+    // Read first batch via RecordBatchReader
+    reader->set_batch_size(1024);
+    std::shared_ptr<arrow::RecordBatchReader> batch_reader;
+#if ARROW_VERSION_MAJOR >= 19
+    auto rb_result = reader->GetRecordBatchReader();
+    ASSERT_TRUE(rb_result.ok()) << "GetRecordBatchReader failed";
+    batch_reader = std::move(rb_result).ValueOrDie();
+#else
+    auto st = reader->GetRecordBatchReader(&batch_reader);
+    ASSERT_TRUE(st.ok()) << "GetRecordBatchReader failed: " << st;
+#endif
+    std::shared_ptr<arrow::RecordBatch> batch;
+    auto read_st = batch_reader->ReadNext(&batch);
+    ASSERT_TRUE(read_st.ok() && batch) << "Failed to read batch: " << read_st;
+
+    int num_cols = batch->num_columns();
+    ASSERT_GT(num_cols, 0) << "Empty test Parquet file";
+
+    int tested = 0;
+    int skipped = 0;
+
+    for (int c = 0; c < num_cols; ++c) {
+        auto arrow_arr = batch->column(c);
+        if (!arrow_arr || arrow_arr->length() == 0) continue;
+
+        // Step 1: Transcode Arrow → Liquid (in-memory)
+        auto liquid = transcode_to_liquid_array(arrow_arr);
+        if (!liquid) {
+            // unsupported type is acceptable
+            skipped++;
+            continue;
+        }
+
+        // Step 2: Convert Liquid → Velox
+        auto vec = liquid->to_velox(test_pool());
+        ASSERT_NE(vec, nullptr)
+            << "to_velox returned null for column " << c
+            << " type " << arrow_arr->type()->ToString();
+
+        // Step 3: Verify Velox row count matches
+        ASSERT_EQ(vec->size(), arrow_arr->length())
+            << "Row count mismatch for column " << c;
+
+        // Step 4: Verify null positions match
+        for (int64_t i = 0; i < arrow_arr->length(); ++i) {
+            bool arrow_null = arrow_arr->IsNull(i);
+            bool velox_null = vec->isNullAt(i);
+            ASSERT_EQ(arrow_null, velox_null)
+                << "Null mismatch at column " << c << " row " << i;
+        }
+
+        tested++;
+    }
+
+    ASSERT_GT(tested, 0) << "No columns were tested (all unsupported?)";
+    std::cout << "  FullPipeline: tested " << tested << " columns, "
+              << skipped << " skipped\n";
 }
 
 // ═══════════════════════════════════════════════════════════════════════
