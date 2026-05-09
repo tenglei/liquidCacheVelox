@@ -623,18 +623,36 @@ TEST(VeloxCrossVal, Float32WithNulls) {
 #include "liquid_cache/liquid_array.h"
 
 TEST(FullPipeline, ParquetToLiquidToVelox) {
-    // Path to the generated test Parquet file
-    const std::string parquet_path =
-        std::string(std::getenv("TEST_PARQUET_PATH") ?
-                    std::getenv("TEST_PARQUET_PATH") :
-                    "build/test_data_512mb.parquet");
-
-    // Open Parquet file
-    auto infile_result = arrow::io::ReadableFile::Open(parquet_path);
-    if (!infile_result.ok()) {
-        GTEST_SKIP() << "Test Parquet file not found: " << parquet_path
-                     << " (set TEST_PARQUET_PATH env var)";
+    // Look for the test Parquet file in multiple locations:
+    //   1. TEST_PARQUET_PATH environment variable (absolute path)
+    //   2. Relative to cwd (ctest runs from build/ directory)
+    //   3. Relative to project root
+    std::string parquet_path;
+    const char* env_path = std::getenv("TEST_PARQUET_PATH");
+    if (env_path) {
+        parquet_path = env_path;
+    } else {
+        for (const auto& candidate : {
+            "test_data_512mb.parquet",           // cwd = build/
+            "build/test_data_512mb.parquet",     // cwd = project root
+        }) {
+            auto result = arrow::io::ReadableFile::Open(candidate);
+            if (result.ok()) {
+                parquet_path = candidate;
+                break;
+            }
+        }
     }
+
+    if (parquet_path.empty()) {
+        GTEST_SKIP() << "Test Parquet file not found. "
+                     << "Run scripts/generate_test_parquet.sh first, "
+                     << "or set TEST_PARQUET_PATH env var.";
+    }
+
+    // Open the Parquet file
+    auto infile_result = arrow::io::ReadableFile::Open(parquet_path);
+    ASSERT_TRUE(infile_result.ok()) << "Failed to re-open: " << parquet_path;
     auto infile = infile_result.ValueOrDie();
 
     std::unique_ptr<parquet::arrow::FileReader> reader;
@@ -697,6 +715,30 @@ TEST(FullPipeline, ParquetToLiquidToVelox) {
             bool velox_null = vec->isNullAt(i);
             ASSERT_EQ(arrow_null, velox_null)
                 << "Null mismatch at column " << c << " row " << i;
+        }
+
+        // Step 5: Spot-check first non-null value for each column
+        // (Per-type value correctness is exhaustively tested by
+        //  the 30 VeloxCrossVal tests above.)
+        for (int64_t i = 0; i < arrow_arr->length(); ++i) {
+            if (arrow_arr->IsNull(i) || vec->isNullAt(i)) continue;
+            auto scalar = arrow_arr->GetScalar(i).ValueOrDie();
+            auto type_id = scalar->type->id();
+
+            if (type_id == arrow::Type::INT32) {
+                EXPECT_EQ(vec->asFlatVector<int32_t>()->valueAt(i),
+                          std::static_pointer_cast<arrow::Int32Scalar>(scalar)->value);
+            } else if (type_id == arrow::Type::INT64) {
+                EXPECT_EQ(vec->asFlatVector<int64_t>()->valueAt(i),
+                          std::static_pointer_cast<arrow::Int64Scalar>(scalar)->value);
+            } else if (type_id == arrow::Type::FLOAT) {
+                EXPECT_FLOAT_EQ(vec->asFlatVector<float>()->valueAt(i),
+                          std::static_pointer_cast<arrow::FloatScalar>(scalar)->value);
+            } else if (type_id == arrow::Type::DOUBLE) {
+                EXPECT_DOUBLE_EQ(vec->asFlatVector<double>()->valueAt(i),
+                          std::static_pointer_cast<arrow::DoubleScalar>(scalar)->value);
+            }
+            break;  // one spot-check per column is sufficient
         }
 
         tested++;
