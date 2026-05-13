@@ -340,6 +340,10 @@ private:
     void bulk_unpack_bw8_avx2(T* out) const {
         const uint32_t n = length_;
         const uint8_t* src = packed_data_.data();
+        if constexpr (sizeof(T) != 1) {
+            bulk_unpack_scalar_blocked(out);
+            return;
+        }
         uint32_t i = 0;
         for (; i + 32 <= n; i += 32) {
             __m256i vec = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i));
@@ -353,6 +357,10 @@ private:
     void bulk_unpack_bw16_avx2(T* out) const {
         const uint32_t n = length_;
         const uint8_t* src = packed_data_.data();
+        if constexpr (sizeof(T) != 2) {
+            bulk_unpack_scalar_blocked(out);
+            return;
+        }
         uint32_t i = 0;
         for (; i + 16 <= n; i += 16) {
             __m256i vec = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i * 2));
@@ -370,6 +378,10 @@ private:
     void bulk_unpack_bw32_avx2(T* out) const {
         const uint32_t n = length_;
         const uint8_t* src = packed_data_.data();
+        if constexpr (sizeof(T) != 4) {
+            bulk_unpack_scalar_blocked(out);
+            return;
+        }
         uint32_t i = 0;
         for (; i + 8 <= n; i += 8) {
             __m256i vec = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i * 4));

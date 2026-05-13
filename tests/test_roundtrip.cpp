@@ -804,6 +804,79 @@ TEST(RoundtripFloat32, AllPatchFillRegression) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// Delta encoding roundtrip tests
+// ═══════════════════════════════════════════════════════════════════════
+
+template <typename ArrowType>
+void test_delta_roundtrip(const std::vector<typename ArrowType::c_type>& values) {
+    using BuilderT = typename arrow::TypeTraits<ArrowType>::BuilderType;
+    BuilderT builder;
+    for (auto v : values) APPEND(builder, v);
+    auto array = builder.Finish().ValueOrDie();
+
+    auto liquid = LiquidPrimitiveDeltaArray<ArrowType>::from_arrow(array);
+    auto decoded = liquid.to_arrow();
+    assert_roundtrip(array, decoded);
+}
+
+TEST(DeltaRoundtrip, Int32Monotonic) {
+    std::vector<int32_t> vals;
+    for (int32_t i = 0; i < 2000; ++i) vals.push_back(i * 2);
+    test_delta_roundtrip<arrow::Int32Type>(vals);
+}
+
+TEST(DeltaRoundtrip, Int64Monotonic) {
+    std::vector<int64_t> vals;
+    for (int64_t i = 0; i < 2000; ++i) vals.push_back(i * 100);
+    test_delta_roundtrip<arrow::Int64Type>(vals);
+}
+
+TEST(DeltaRoundtrip, Int32WithNulls) {
+    arrow::Int32Builder b;
+    APPEND(b, 100); APPEND_NULL(b); APPEND(b, 200); APPEND_NULL(b); APPEND(b, 300);
+    auto arr = b.Finish().ValueOrDie();
+    auto liquid = LiquidPrimitiveDeltaArray<arrow::Int32Type>::from_arrow(arr);
+    auto decoded = liquid.to_arrow();
+    assert_roundtrip(arr, decoded);
+}
+
+TEST(DeltaRoundtrip, Int64WithNulls) {
+    arrow::Int64Builder b;
+    APPEND(b, 1000LL); APPEND_NULL(b); APPEND(b, 2000LL); APPEND(b, 3000LL);
+    auto arr = b.Finish().ValueOrDie();
+    auto liquid = LiquidPrimitiveDeltaArray<arrow::Int64Type>::from_arrow(arr);
+    auto decoded = liquid.to_arrow();
+    assert_roundtrip(arr, decoded);
+}
+
+TEST(DeltaRoundtrip, AllNull) {
+    auto arr = arrow::MakeArrayOfNull(arrow::int32(), 10).ValueOrDie();
+    auto liquid = LiquidPrimitiveDeltaArray<arrow::Int32Type>::from_arrow(arr);
+    auto decoded = liquid.to_arrow();
+    assert_roundtrip(arr, decoded);
+}
+
+TEST(DeltaRoundtrip, SingleElement) {
+    test_delta_roundtrip<arrow::Int32Type>({42});
+}
+
+TEST(DeltaRoundtrip, CompressionBetterThanPrimitive) {
+    // Monotonic sequence: delta should compress better than FoR
+    std::vector<int32_t> vals;
+    for (int32_t i = 0; i < 10000; ++i) vals.push_back(i);
+    arrow::Int32Builder b;
+    for (auto v : vals) APPEND(b, v);
+    auto arr = b.Finish().ValueOrDie();
+
+    auto primitive = LiquidPrimitiveArray<arrow::Int32Type>::from_arrow(arr);
+    auto delta = LiquidPrimitiveDeltaArray<arrow::Int32Type>::from_arrow(arr);
+
+    EXPECT_LE(delta.bit_width(), primitive.bit_width())
+        << "Delta bit_width=" << static_cast<int>(delta.bit_width())
+        << " should be <= primitive bit_width=" << static_cast<int>(primitive.bit_width());
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Custom main() to initialize Arrow compute for static linking
 // ═══════════════════════════════════════════════════════════════════════
 

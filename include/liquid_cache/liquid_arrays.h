@@ -622,6 +622,177 @@ using LiquidLinearDate32Array = LiquidLinearIntegerArray<arrow::Date32Type>;
 using LiquidLinearDate64Array = LiquidLinearIntegerArray<arrow::Date64Type>;
 
 
+// ═══════════════════════════════════════════════════════════════════════
+// LiquidPrimitiveDeltaArray<T>
+//
+// Delta + ZigZag encoding for monotonic/near-monotonic integer sequences.
+// Mirrors Rust LiquidPrimitiveDeltaArray.
+//
+// Encoding: anchor = first non-null value
+//           delta[i] = value[i] - value[i-1] (wrapping, as unsigned)
+//           zigzag[i] = ((delta_i64 << 1) ^ (delta_i64 >> 63)) as unsigned
+//           packed = BitPackedArray(zigzag, bit_width)
+// ═══════════════════════════════════════════════════════════════════════
+
+template <typename ArrowType>
+class LiquidPrimitiveDeltaArray {
+public:
+    using NativeT = typename ArrowType::c_type;
+    using UnsignedT = typename UnsignedType<ArrowType>::type;
+
+    LiquidPrimitiveDeltaArray() = default;
+
+    /// Encode from Arrow array using delta + zigzag encoding.
+    static LiquidPrimitiveDeltaArray from_arrow(
+            const std::shared_ptr<arrow::Array>& array) {
+        using ArrayT = typename arrow::TypeTraits<ArrowType>::ArrayType;
+        auto typed = std::static_pointer_cast<ArrayT>(array);
+        const int64_t len = typed->length();
+
+        LiquidPrimitiveDeltaArray result;
+
+        // All-null case
+        if (typed->null_count() == len) {
+            result.anchor_ = 0;
+            std::vector<uint64_t> zeros(len, 0);
+            std::vector<uint8_t> null_bits((len + 7) / 8, 0);
+            result.bit_packed_ = BitPackedArray(zeros.data(), null_bits.data(),
+                                                 static_cast<uint32_t>(len), 0);
+            return result;
+        }
+
+        const uint8_t* nulls = typed->null_bitmap_data();
+        int64_t off = typed->offset();
+
+        std::vector<uint64_t> zigzag_offsets(static_cast<size_t>(len));
+        UnsignedT max_val = 0;
+        NativeT anchor = 0;
+        bool have_prev = false;
+        NativeT prev = 0;
+
+        for (int64_t i = 0; i < len; ++i) {
+            bool valid = !nulls || arrow::bit_util::GetBit(nulls, off + i);
+            if (!valid) {
+                zigzag_offsets[static_cast<size_t>(i)] = 0;
+                continue;
+            }
+            NativeT v = typed->Value(i);
+            if (!have_prev) {
+                anchor = v;
+                prev = v;
+                have_prev = true;
+                zigzag_offsets[static_cast<size_t>(i)] = 0;
+                continue;
+            }
+            // Wrapping delta: cast to unsigned first to avoid signed overflow UB
+            UnsignedT ucur = static_cast<UnsignedT>(v);
+            UnsignedT uprev = static_cast<UnsignedT>(prev);
+            UnsignedT udelta = ucur - uprev;
+
+            // Zigzag encode: map signed to unsigned (small negatives -> small positives)
+            NativeT sdelta = static_cast<NativeT>(udelta);
+            int64_t delta_i64 = static_cast<int64_t>(sdelta);
+            uint64_t zigzag = static_cast<uint64_t>((delta_i64 << 1) ^ (delta_i64 >> 63));
+            UnsignedT zigzag_u = static_cast<UnsignedT>(zigzag);
+
+            if (zigzag_u > max_val) max_val = zigzag_u;
+            zigzag_offsets[static_cast<size_t>(i)] = static_cast<uint64_t>(zigzag_u);
+            prev = v;
+        }
+
+        result.anchor_ = anchor;
+        uint8_t bw = get_bit_width(static_cast<uint64_t>(max_val));
+
+        // Build null bitmap
+        std::vector<uint8_t> null_bits;
+        const uint8_t* null_bitmap_ptr = nullptr;
+        if (nulls && typed->null_count() > 0) {
+            size_t bitmap_bytes = static_cast<size_t>((len + 7) / 8);
+            null_bits.assign(nulls + off / 8, nulls + off / 8 + bitmap_bytes);
+            null_bitmap_ptr = null_bits.data();
+        }
+
+        result.bit_packed_ = BitPackedArray(zigzag_offsets.data(), null_bitmap_ptr,
+                                             static_cast<uint32_t>(len), bw);
+        return result;
+    }
+
+    /// Decode back to Arrow array via inverse zigzag + cumulative add.
+    std::shared_ptr<arrow::Array> to_arrow() const {
+        uint32_t len = bit_packed_.length();
+        if (len == 0) {
+            if constexpr (has_arrow_type_singleton<ArrowType>::value) {
+                return arrow::MakeEmptyArray(
+                    arrow::TypeTraits<ArrowType>::type_singleton()).ValueOrDie();
+            }
+            return arrow::MakeEmptyArray(arrow::int64()).ValueOrDie();
+        }
+
+        std::vector<UnsignedT> temp(len);
+        bit_packed_.bulk_unpack_to(temp.data());
+
+        int64_t buf_size = static_cast<int64_t>(len) * sizeof(NativeT);
+        auto value_buf = arrow::AllocateBuffer(buf_size).ValueOrDie();
+        auto* values = reinterpret_cast<NativeT*>(value_buf->mutable_data());
+
+        NativeT current = anchor_;
+        bool have_first = false;
+
+        for (uint32_t i = 0; i < len; ++i) {
+            if (bit_packed_.is_null(i)) {
+                values[i] = 0;
+                continue;
+            }
+            if (!have_first) {
+                values[i] = anchor_;
+                current = anchor_;
+                have_first = true;
+                continue;
+            }
+            // Inverse zigzag: (zigzag >> 1) ^ -(zigzag & 1)
+            uint64_t zigzag = static_cast<uint64_t>(temp[i]);
+            int64_t delta_i64 = static_cast<int64_t>(zigzag >> 1)
+                              ^ -static_cast<int64_t>(zigzag & 1);
+            UnsignedT udelta = static_cast<UnsignedT>(static_cast<NativeT>(delta_i64));
+            UnsignedT ucur = static_cast<UnsignedT>(current);
+            NativeT next = static_cast<NativeT>(ucur + udelta);
+            values[i] = next;
+            current = next;
+        }
+
+        auto null_buf = bit_packed_.null_bitmap_arrow_buffer();
+        int64_t nc = bit_packed_.null_count();
+        std::shared_ptr<arrow::DataType> arrow_type;
+        if constexpr (has_arrow_type_singleton<ArrowType>::value) {
+            arrow_type = arrow::TypeTraits<ArrowType>::type_singleton();
+        } else {
+            arrow_type = arrow::int64();
+        }
+        auto data = arrow::ArrayData::Make(
+            arrow_type, static_cast<int64_t>(len),
+            {std::move(null_buf), std::move(value_buf)}, nc);
+        return arrow::MakeArray(data);
+    }
+
+    uint32_t length() const { return bit_packed_.length(); }
+    uint8_t bit_width() const { return bit_packed_.bit_width(); }
+    size_t memory_size() const { return bit_packed_.memory_size() + sizeof(*this); }
+    NativeT anchor() const { return anchor_; }
+
+#ifdef LIQUID_ENABLE_VELOX
+    facebook::velox::VectorPtr to_velox(
+        facebook::velox::memory::MemoryPool* pool) const;
+#endif
+
+private:
+    NativeT anchor_ = 0;
+    BitPackedArray bit_packed_;
+};
+
+// Type aliases
+using LiquidDeltaI32Array = LiquidPrimitiveDeltaArray<arrow::Int32Type>;
+using LiquidDeltaI64Array = LiquidPrimitiveDeltaArray<arrow::Int64Type>;
+
 
 // ═══════════════════════════════════════════════════════════════════════
 // LiquidFloatArray<T>
