@@ -820,20 +820,13 @@ public:
                 static_cast<UnsignedInt>(encoded[i] - min_val));
         }
 
-        // Build null bitmap
+        // Build null bitmap (account for sliced-array offset, same as LiquidPrimitiveArray)
         const uint8_t* null_bitmap = nullptr;
         std::vector<uint8_t> null_bits;
         if (typed->null_count() > 0 && typed->null_bitmap()) {
             size_t bitmap_bytes = (len + 7) / 8;
-            if (typed->null_bitmap()->size() >= static_cast<int64_t>(bitmap_bytes)) {
-                null_bits.assign(typed->null_bitmap()->data(),
-                                 typed->null_bitmap()->data() + bitmap_bytes);
-            } else if (typed->null_bitmap()) {
-                // bitmap 存在但可能比预期小，安全拷贝
-                size_t safe_bytes = std::min<size_t>(bitmap_bytes, typed->null_bitmap()->size());
-                null_bits.resize(bitmap_bytes, 0xFF);
-                std::memcpy(null_bits.data(), typed->null_bitmap()->data(), safe_bytes);
-            }
+            const uint8_t* bitmap_src = typed->null_bitmap()->data() + typed->offset() / 8;
+            null_bits.assign(bitmap_src, bitmap_src + bitmap_bytes);
             null_bitmap = null_bits.data();
         }
 
