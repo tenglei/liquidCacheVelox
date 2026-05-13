@@ -562,8 +562,8 @@ LiquidCacheStore::load_from_parquet_for_velox(
         facebook::velox::RowTypePtr& veloxRowType,
         double& transcode_sec) {
     std::shared_ptr<arrow::Schema> schema;
-    auto rg_infos = load_from_parquet(
-        files, schema, transcode_sec, transcode_to_liquid_array);
+    // Use the new overload with automatic FSST compressor reuse
+    auto rg_infos = load_from_parquet(files, schema, transcode_sec);
     if (schema) {
         veloxRowType = arrow_schema_to_velox_row_type(schema);
     }
@@ -645,6 +645,69 @@ VectorPtr LiquidCacheStore::read_batch_velox(
     return std::make_shared<RowVector>(
         pool, projRowType, nullptr, numRows, std::move(children));
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// LiquidPrimitiveDeltaArray<T>::to_velox()
+//
+// Decodes delta + zigzag encoding directly into Velox FlatVector.
+// Reconstructs values via inverse zigzag + cumulative wrapping add.
+// ═══════════════════════════════════════════════════════════════════════
+
+template <typename ArrowType>
+VectorPtr LiquidPrimitiveDeltaArray<ArrowType>::to_velox(
+        memory::MemoryPool* pool) const {
+    using NativeT = typename ArrowType::c_type;
+    using UnsignedT = typename UnsignedType<ArrowType>::type;
+
+    uint32_t len = bit_packed_.length();
+    if (len == 0) {
+        auto pt = ArrowPhysicalType<ArrowType>::value;
+        return BaseVector::create(liquid_physical_to_velox_type(pt), 0, pool);
+    }
+
+    auto nulls = copy_null_bitmap_to_velox(bit_packed_, pool);
+    auto valuesBuf = AlignedBuffer::allocate<NativeT>(len, pool);
+    auto* rawValues = valuesBuf->template asMutable<NativeT>();
+
+    // Unpack zigzag values
+    std::vector<UnsignedT> temp(len);
+    bit_packed_.bulk_unpack_to(temp.data());
+
+    // Reconstruct: inverse zigzag + cumulative wrapping add
+    NativeT current = anchor_;
+    bool have_first = false;
+
+    for (uint32_t i = 0; i < len; ++i) {
+        if (bit_packed_.is_null(i)) {
+            rawValues[i] = 0;
+            continue;
+        }
+        if (!have_first) {
+            rawValues[i] = anchor_;
+            current = anchor_;
+            have_first = true;
+            continue;
+        }
+        uint64_t zigzag = static_cast<uint64_t>(temp[i]);
+        int64_t delta_i64 = static_cast<int64_t>(zigzag >> 1)
+                          ^ -static_cast<int64_t>(zigzag & 1);
+        UnsignedT udelta = static_cast<UnsignedT>(static_cast<NativeT>(delta_i64));
+        UnsignedT ucur = static_cast<UnsignedT>(current);
+        rawValues[i] = static_cast<NativeT>(ucur + udelta);
+        current = rawValues[i];
+    }
+
+    auto pt = ArrowPhysicalType<ArrowType>::value;
+    auto veloxType = liquid_physical_to_velox_type(pt);
+    return std::make_shared<FlatVector<NativeT>>(
+        pool, veloxType, nulls,
+        static_cast<vector_size_t>(len), valuesBuf,
+        std::vector<BufferPtr>{});
+}
+
+// Explicit instantiations
+template VectorPtr LiquidPrimitiveDeltaArray<arrow::Int32Type>::to_velox(memory::MemoryPool*) const;
+template VectorPtr LiquidPrimitiveDeltaArray<arrow::Int64Type>::to_velox(memory::MemoryPool*) const;
 
 }  // namespace liquid_cache
 

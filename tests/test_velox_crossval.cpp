@@ -1125,6 +1125,55 @@ TEST(VeloxCrossVal, TimestampNegativeAndExtreme) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// Delta encoding Velox cross-validation
+// ═══════════════════════════════════════════════════════════════════════
+
+TEST(VeloxCrossVal, DeltaInt32Monotonic) {
+    arrow::Int32Builder b;
+    for (int32_t i = 0; i < 200; ++i) APPEND(b, i);
+    auto arr = b.Finish().ValueOrDie();
+    auto liquid = LiquidPrimitiveDeltaArray<arrow::Int32Type>::from_arrow(arr);
+    auto vec = liquid.to_velox(test_pool());
+    auto flat = vec->asFlatVector<int32_t>();
+    ASSERT_EQ(flat->size(), 200);
+    EXPECT_EQ(flat->valueAt(0), 0);
+    EXPECT_EQ(flat->valueAt(199), 199);
+}
+
+TEST(VeloxCrossVal, DeltaInt32WithNulls) {
+    arrow::Int32Builder b;
+    APPEND(b, 100); APPEND_NULL(b); APPEND(b, 200); APPEND(b, 300);
+    auto arr = b.Finish().ValueOrDie();
+    auto liquid = LiquidPrimitiveDeltaArray<arrow::Int32Type>::from_arrow(arr);
+    auto vec = liquid.to_velox(test_pool());
+    auto flat = vec->asFlatVector<int32_t>();
+    EXPECT_FALSE(flat->isNullAt(0)); EXPECT_EQ(flat->valueAt(0), 100);
+    EXPECT_TRUE(flat->isNullAt(1));
+    EXPECT_FALSE(flat->isNullAt(2)); EXPECT_EQ(flat->valueAt(2), 200);
+}
+
+TEST(VeloxCrossVal, DeltaInt64Monotonic) {
+    arrow::Int64Builder b;
+    for (int64_t i = 0; i < 200; ++i) APPEND(b, i * 1000LL);
+    auto arr = b.Finish().ValueOrDie();
+    auto liquid = LiquidPrimitiveDeltaArray<arrow::Int64Type>::from_arrow(arr);
+    auto vec = liquid.to_velox(test_pool());
+    auto flat = vec->asFlatVector<int64_t>();
+    ASSERT_EQ(flat->size(), 200);
+    EXPECT_EQ(flat->valueAt(0), 0);
+    EXPECT_EQ(flat->valueAt(199), 199000LL);
+}
+
+TEST(VeloxCrossVal, DeltaInt64AllNull) {
+    auto arr = arrow::MakeArrayOfNull(arrow::int64(), 5).ValueOrDie();
+    auto liquid = LiquidPrimitiveDeltaArray<arrow::Int64Type>::from_arrow(arr);
+    auto vec = liquid.to_velox(test_pool());
+    ASSERT_NE(vec, nullptr);
+    EXPECT_EQ(vec->size(), 5);
+    EXPECT_TRUE(vec->isNullAt(0));
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Custom main() to initialize Arrow compute for static linking
 // ═══════════════════════════════════════════════════════════════════════
 
