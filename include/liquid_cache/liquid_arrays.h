@@ -46,7 +46,11 @@ namespace liquid_cache {
 // Utility: compute the minimum number of bits to represent `value`
 // ═══════════════════════════════════════════════════════════════════════
 inline uint8_t get_bit_width(uint64_t value) {
-    if (value == 0) return 0;
+    // Return 1 for zero to match Rust's NonZero<u8> convention.
+    // BitPackedArray handles bw=0 as a special "all-zero" case
+    // internally (packed_data_.clear()); this function's contract is
+    // to return the minimum bit width needed, which is 1 even for 0.
+    if (value == 0) return 1;
     return static_cast<uint8_t>(64 - __builtin_clzll(value));
 }
 

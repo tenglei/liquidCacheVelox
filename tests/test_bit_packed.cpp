@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "liquid_cache/bit_packed_array.h"
+#include "liquid_cache/liquid_arrays.h"
 
 using namespace liquid_cache;
 
@@ -288,4 +289,20 @@ TEST(BitPackedArray, LargeArray) {
     // Verify memory size is reasonable (N * 10 bits / 8 bytes)
     size_t expected_min = (static_cast<size_t>(N) * 10 + 7) / 8;
     EXPECT_GE(bpa.memory_size(), expected_min);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Regression: get_bit_width(0) must return 1 for Rust compatibility.
+// Rust uses NonZero<u8> with minimum 1.
+// ═══════════════════════════════════════════════════════════════════════
+
+TEST(BitPackedUtils, GetBitWidthZero) {
+    EXPECT_EQ(get_bit_width(0), 1);
+}
+
+TEST(BitPackedUtils, GetBitWidthPowersOfTwo) {
+    EXPECT_EQ(get_bit_width(1), 1);
+    EXPECT_EQ(get_bit_width(255), 8);
+    EXPECT_EQ(get_bit_width(256), 9);
+    EXPECT_EQ(get_bit_width(UINT64_MAX), 64);
 }

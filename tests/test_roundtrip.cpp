@@ -665,7 +665,7 @@ TEST(RoundtripEdge, ConstantValues) {
     auto array = builder.Finish().ValueOrDie();
 
     auto liquid = LiquidPrimitiveArray<arrow::Int32Type>::from_arrow(array);
-    EXPECT_EQ(liquid.bit_width(), 0);  // constant → 0 bits needed
+    EXPECT_EQ(liquid.bit_width(), 1);  // constant → bw=1 (Rust NonZero<u8> minimum)
     auto decoded = liquid.to_arrow();
     assert_roundtrip(array, decoded);
 }
