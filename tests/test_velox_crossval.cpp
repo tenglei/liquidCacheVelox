@@ -410,6 +410,94 @@ TEST(VeloxCrossVal, LinearInt32WithNulls) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// LinearInteger Velox tests for all 8 remaining specializations
+// ═══════════════════════════════════════════════════════════════════════
+
+TEST(VeloxCrossVal, LinearInt8) {
+    arrow::Int8Builder b;
+    for (int8_t v = 0; v < 50; ++v) APPEND(b, v);
+    auto arr = b.Finish().ValueOrDie();
+    auto liquid = LiquidLinearIntegerArray<arrow::Int8Type>::from_arrow(arr);
+    auto vec = liquid.to_velox(test_pool());
+    auto flat = vec->asFlatVector<int8_t>();
+    ASSERT_EQ(flat->size(), 50);
+    EXPECT_EQ(flat->valueAt(0), 0);
+    EXPECT_EQ(flat->valueAt(49), 49);
+}
+
+TEST(VeloxCrossVal, LinearInt16) {
+    arrow::Int16Builder b;
+    for (int16_t v = 100; v < 150; ++v) APPEND(b, v);
+    auto arr = b.Finish().ValueOrDie();
+    auto liquid = LiquidLinearIntegerArray<arrow::Int16Type>::from_arrow(arr);
+    auto vec = liquid.to_velox(test_pool());
+    auto flat = vec->asFlatVector<int16_t>();
+    ASSERT_EQ(flat->size(), 50);
+    EXPECT_EQ(flat->valueAt(0), 100);
+    EXPECT_EQ(flat->valueAt(49), 149);
+}
+
+TEST(VeloxCrossVal, LinearUInt8) {
+    arrow::UInt8Builder b;
+    for (uint8_t v = 10; v < 60; ++v) APPEND(b, v);
+    auto arr = b.Finish().ValueOrDie();
+    auto liquid = LiquidLinearIntegerArray<arrow::UInt8Type>::from_arrow(arr);
+    auto vec = liquid.to_velox(test_pool());
+    auto flat = vec->asFlatVector<uint8_t>();
+    ASSERT_EQ(flat->size(), 50);
+}
+
+TEST(VeloxCrossVal, LinearUInt16) {
+    arrow::UInt16Builder b;
+    for (uint16_t v = 1000; v < 1050; ++v) APPEND(b, v);
+    auto arr = b.Finish().ValueOrDie();
+    auto liquid = LiquidLinearIntegerArray<arrow::UInt16Type>::from_arrow(arr);
+    auto vec = liquid.to_velox(test_pool());
+    auto flat = vec->asFlatVector<uint16_t>();
+    ASSERT_EQ(flat->size(), 50);
+}
+
+TEST(VeloxCrossVal, LinearUInt32) {
+    arrow::UInt32Builder b;
+    for (uint32_t v = 0; v < 50; ++v) APPEND(b, v + 100000);
+    auto arr = b.Finish().ValueOrDie();
+    auto liquid = LiquidLinearIntegerArray<arrow::UInt32Type>::from_arrow(arr);
+    auto vec = liquid.to_velox(test_pool());
+    auto flat = vec->asFlatVector<uint32_t>();
+    ASSERT_EQ(flat->size(), 50);
+}
+
+TEST(VeloxCrossVal, LinearUInt64) {
+    arrow::UInt64Builder b;
+    for (uint64_t v = 0; v < 50; ++v) APPEND(b, v + 10000000000ULL);
+    auto arr = b.Finish().ValueOrDie();
+    auto liquid = LiquidLinearIntegerArray<arrow::UInt64Type>::from_arrow(arr);
+    auto vec = liquid.to_velox(test_pool());
+    auto flat = vec->asFlatVector<uint64_t>();
+    ASSERT_EQ(flat->size(), 50);
+}
+
+TEST(VeloxCrossVal, LinearDate32) {
+    arrow::Date32Builder b;
+    for (int32_t v = 19000; v < 19050; ++v) APPEND(b, v);
+    auto arr = b.Finish().ValueOrDie();
+    auto liquid = LiquidLinearIntegerArray<arrow::Date32Type>::from_arrow(arr);
+    auto vec = liquid.to_velox(test_pool());
+    auto flat = vec->asFlatVector<int32_t>();
+    ASSERT_EQ(flat->size(), 50);
+}
+
+TEST(VeloxCrossVal, LinearDate64) {
+    arrow::Date64Builder b;
+    for (int64_t v = 0; v < 50; ++v) APPEND(b, v * 86400000LL + 1648000000000LL);
+    auto arr = b.Finish().ValueOrDie();
+    auto liquid = LiquidLinearIntegerArray<arrow::Date64Type>::from_arrow(arr);
+    auto vec = liquid.to_velox(test_pool());
+    auto flat = vec->asFlatVector<int32_t>();
+    ASSERT_EQ(flat->size(), 50);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Float type cross-validation
 // ═══════════════════════════════════════════════════════════════════════
 
