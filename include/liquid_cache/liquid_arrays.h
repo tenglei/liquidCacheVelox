@@ -98,11 +98,16 @@ template <> struct ArrowPhysicalType<arrow::TimestampType> { static constexpr Ph
 //            bit_width  = bits needed for max(offset)
 //            packed     = BitPackedArray(offsets, bit_width)
 //
-// Serialization layout (identical to Rust):
+// Serialization layout:
 //   [LiquidIPCHeader: 16B]
 //   [reference_value: sizeof(NativeT)]
 //   [padding to 8-byte alignment]
-//   [BitPackedArray serialized data]
+//   [BitPackedArray: 16B header + packed data]
+//
+// NOTE: The IPC-header envelope and field order match Rust, but the
+// internal BitPackedArray uses sequential (not FastLanes 1024-block)
+// packing.  The two implementations are NOT byte-identical for
+// non-trivial bit widths (bw ∉ {0, 32, 64}).  See bit_packed_array.h.
 // ═══════════════════════════════════════════════════════════════════════
 
 // Type trait: check if ArrowType has TypeTraits<T>::type_singleton().
@@ -629,7 +634,7 @@ using LiquidLinearDate64Array = LiquidLinearIntegerArray<arrow::Date64Type>;
 //   4. Bit-pack encoded values (minus min) with determined bit width
 //   5. Store patches (indices + original values) separately
 //
-// Serialization layout (identical to Rust):
+// Serialization layout:
 //   [LiquidIPCHeader: 16B]
 //   [reference_value: sizeof(SignedIntT)]
 //   [padding to 8B]
@@ -638,6 +643,9 @@ using LiquidLinearDate64Array = LiquidLinearIntegerArray<arrow::Date64Type>;
 //   [patch_indices: 8B * N] [patch_values: sizeof(FloatT) * N]
 //   [padding to 8B]
 //   [BitPackedArray data]
+//
+// NOTE: Same caveat as LiquidPrimitiveArray — BitPackedArray internal
+// layout differs from Rust's FastLanes blocks.
 // ═══════════════════════════════════════════════════════════════════════
 
 struct Exponents {

@@ -1,6 +1,12 @@
 // liquid_cache/bit_packed_array.h
-// BitPackedArray - SIMD-friendly bit-packed integer storage
-// Mirrors the Rust BitPackedArray from liquid-cache/src/core/src/liquid_array/raw/
+// BitPackedArray — sequential bit-packed integer storage.
+//
+// Uses sequential (not FastLanes 1024-block) packing.  This is a
+// simpler layout than the Rust implementation at
+// liquid-cache/src/core/src/liquid_array/raw/ which uses FastLanes
+// chunked blocks with zero-padding to 1024-element boundaries.
+// The two formats are NOT byte-identical for non-trivial bit widths
+// (bw ∉ {0, 32, 64}).  The 16-byte header structure is shared.
 #pragma once
 
 #include <arrow/buffer.h>
