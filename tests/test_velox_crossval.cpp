@@ -16,6 +16,7 @@
 
 #include "velox/common/memory/Memory.h"
 #include "velox/vector/FlatVector.h"
+#include "velox/type/HugeInt.h"
 #include "velox/type/Timestamp.h"
 
 #include "liquid_cache/liquid_arrays.h"
@@ -858,6 +859,181 @@ TEST(FullPipeline, ParquetToLiquidToVelox) {
     ASSERT_GT(tested, 0) << "No columns were tested (all unsupported?)";
     std::cout << "  FullPipeline: tested " << tested << " columns, "
               << skipped << " skipped\n";
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Large string/binary and view type Velox tests
+// ═══════════════════════════════════════════════════════════════════════
+
+TEST(VeloxCrossVal, LargeString) {
+    arrow::LargeStringBuilder b;
+    APPEND(b, "hello"); APPEND(b, "world"); APPEND(b, "large_string_test");
+    auto arr = b.Finish().ValueOrDie();
+    auto liquid = LiquidByteViewArray::from_arrow(arr);
+    auto vec = liquid.to_velox(test_pool());
+    auto flat = vec->asFlatVector<StringView>();
+    ASSERT_EQ(flat->size(), 3);
+    EXPECT_EQ(std::string(flat->valueAt(0)), "hello");
+    EXPECT_EQ(std::string(flat->valueAt(2)), "large_string_test");
+}
+
+TEST(VeloxCrossVal, LargeBinary) {
+    arrow::LargeBinaryBuilder b;
+    APPEND(b, "bin1"); APPEND(b, "binary_data");
+    auto arr = b.Finish().ValueOrDie();
+    auto liquid = LiquidByteViewArray::from_arrow(arr);
+    auto vec = liquid.to_velox(test_pool());
+    auto flat = vec->asFlatVector<StringView>();
+    ASSERT_EQ(flat->size(), 2);
+    EXPECT_EQ(std::string(flat->valueAt(0)), "bin1");
+}
+
+TEST(VeloxCrossVal, StringView) {
+    arrow::StringViewBuilder b;
+    APPEND(b, "view1"); APPEND(b, "view2");
+    auto arr = b.Finish().ValueOrDie();
+    auto cast_arr = arrow::compute::Cast(*arr, arrow::utf8()).ValueOrDie();
+    auto liquid = LiquidByteViewArray::from_arrow(cast_arr);
+    auto vec = liquid.to_velox(test_pool());
+    auto flat = vec->asFlatVector<StringView>();
+    ASSERT_EQ(flat->size(), 2);
+}
+
+TEST(VeloxCrossVal, BinaryView) {
+    arrow::BinaryViewBuilder b;
+    APPEND(b, "bview1"); APPEND(b, "bview2");
+    auto arr = b.Finish().ValueOrDie();
+    auto cast_arr = arrow::compute::Cast(*arr, arrow::binary()).ValueOrDie();
+    auto liquid = LiquidByteViewArray::from_arrow(cast_arr);
+    auto vec = liquid.to_velox(test_pool());
+    auto flat = vec->asFlatVector<StringView>();
+    ASSERT_EQ(flat->size(), 2);
+}
+
+TEST(VeloxCrossVal, DictionaryString) {
+    arrow::StringBuilder vb;
+    APPEND(vb, "alpha"); APPEND(vb, "beta"); APPEND(vb, "gamma");
+    auto dict_values = vb.Finish().ValueOrDie();
+    arrow::UInt16Builder kb;
+    APPEND(kb, 0); APPEND(kb, 1); APPEND(kb, 2); APPEND(kb, 0); APPEND(kb, 1);
+    auto dict_keys = kb.Finish().ValueOrDie();
+    auto dict_arr = arrow::DictionaryArray::FromArrays(
+        arrow::dictionary(arrow::uint16(), arrow::utf8()),
+        dict_keys, dict_values).ValueOrDie();
+    auto dense = arrow::compute::Cast(*dict_arr, arrow::utf8()).ValueOrDie();
+    auto liquid = LiquidByteViewArray::from_arrow(dense);
+    auto vec = liquid.to_velox(test_pool());
+    auto flat = vec->asFlatVector<StringView>();
+    ASSERT_EQ(flat->size(), 5);
+    EXPECT_EQ(std::string(flat->valueAt(0)), "alpha");
+    EXPECT_EQ(std::string(flat->valueAt(3)), "alpha");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Decimal256 Velox tests (both fits_u64 and large-values paths)
+// ═══════════════════════════════════════════════════════════════════════
+
+TEST(VeloxCrossVal, Decimal256FitsU64) {
+    auto type = arrow::decimal256(18, 2);
+    arrow::Decimal256Builder b(type);
+    APPEND(b, arrow::Decimal256::FromString("12345").ValueOrDie());
+    APPEND(b, arrow::Decimal256::FromString("67890").ValueOrDie());
+    auto arr = b.Finish().ValueOrDie();
+    auto liquid = LiquidDecimalArray::from_arrow(arr);
+    auto vec = liquid.to_velox(test_pool());
+    ASSERT_NE(vec, nullptr);
+    auto flat = vec->asFlatVector<int64_t>();
+    ASSERT_EQ(flat->size(), 2);
+    EXPECT_EQ(flat->valueAt(0), 12345);
+}
+
+TEST(VeloxCrossVal, Decimal256LargeValues) {
+    auto type = arrow::decimal256(38, 0);
+    arrow::Decimal256Builder b(type);
+    auto large = arrow::Decimal256::FromString("123456789012345678901234567890").ValueOrDie();
+    APPEND(b, large);
+    auto arr = b.Finish().ValueOrDie();
+    auto liquid = LiquidFixedLenByteArray::from_decimal256(arr);
+    auto vec = liquid.to_velox(test_pool());
+    ASSERT_NE(vec, nullptr);
+    auto flat = vec->asFlatVector<int128_t>();
+    ASSERT_EQ(flat->size(), 1);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Edge case Velox tests
+// ═══════════════════════════════════════════════════════════════════════
+
+TEST(VeloxCrossVal, EmptyArray) {
+    auto arr = arrow::MakeEmptyArray(arrow::int32()).ValueOrDie();
+    auto liquid = LiquidPrimitiveArray<arrow::Int32Type>::from_arrow(arr);
+    auto vec = liquid.to_velox(test_pool());
+    ASSERT_NE(vec, nullptr);
+    EXPECT_EQ(vec->size(), 0);
+}
+
+TEST(VeloxCrossVal, SingleElement) {
+    arrow::Int64Builder b;
+    APPEND(b, 42LL);
+    auto arr = b.Finish().ValueOrDie();
+    auto liquid = LiquidPrimitiveArray<arrow::Int64Type>::from_arrow(arr);
+    auto vec = liquid.to_velox(test_pool());
+    auto flat = vec->asFlatVector<int64_t>();
+    ASSERT_EQ(flat->size(), 1);
+    EXPECT_EQ(flat->valueAt(0), 42);
+}
+
+TEST(VeloxCrossVal, AllNullFloat64) {
+    arrow::DoubleBuilder b;
+    APPEND_NULL(b); APPEND_NULL(b); APPEND_NULL(b);
+    auto arr = b.Finish().ValueOrDie();
+    auto liquid = LiquidFloatArray<double>::from_arrow(arr);
+    auto vec = liquid.to_velox(test_pool());
+    ASSERT_NE(vec, nullptr);
+    EXPECT_EQ(vec->size(), 3);
+    EXPECT_TRUE(vec->isNullAt(0));
+    EXPECT_TRUE(vec->isNullAt(1));
+}
+
+TEST(VeloxCrossVal, AllNullString) {
+    arrow::StringBuilder b;
+    APPEND_NULL(b); APPEND_NULL(b);
+    auto arr = b.Finish().ValueOrDie();
+    auto liquid = LiquidByteViewArray::from_arrow(arr);
+    auto vec = liquid.to_velox(test_pool());
+    ASSERT_NE(vec, nullptr);
+    EXPECT_EQ(vec->size(), 2);
+    EXPECT_TRUE(vec->isNullAt(0));
+}
+
+TEST(VeloxCrossVal, Float32Extremes) {
+    std::vector<float> vals = {0.0f, 1.0f, -1.0f,
+        std::numeric_limits<float>::max(),
+        std::numeric_limits<float>::lowest(),
+        std::numeric_limits<float>::min()};
+    arrow::FloatBuilder b;
+    for (auto v : vals) APPEND(b, v);
+    auto arr = b.Finish().ValueOrDie();
+    auto liquid = LiquidFloatArray<float>::from_arrow(arr);
+    auto vec = liquid.to_velox(test_pool());
+    auto flat = vec->asFlatVector<float>();
+    for (size_t i = 0; i < vals.size(); ++i) {
+        EXPECT_FLOAT_EQ(flat->valueAt(i), vals[i]);
+    }
+}
+
+TEST(VeloxCrossVal, TimestampNegativeAndExtreme) {
+    auto type = arrow::timestamp(arrow::TimeUnit::MICRO);
+    arrow::TimestampBuilder b(type, arrow::default_memory_pool());
+    APPEND(b, -86400000000LL);
+    APPEND(b, 0LL);
+    APPEND(b, 253402300799999999LL);
+    auto arr = b.Finish().ValueOrDie();
+    auto liquid = LiquidPrimitiveArray<arrow::TimestampType>::from_arrow(arr);
+    auto vec = liquid.to_velox(test_pool());
+    auto flat = vec->asFlatVector<Timestamp>();
+    EXPECT_FALSE(flat->isNullAt(0));
+    EXPECT_FALSE(flat->isNullAt(1));
 }
 
 // ═══════════════════════════════════════════════════════════════════════
