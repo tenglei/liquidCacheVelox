@@ -422,6 +422,7 @@ public:
         if (typed->null_count() == len) {
             auto null_arr = arrow::MakeArrayOfNull(arrow::int64(), len).ValueOrDie();
             result.residuals_ = LiquidPrimitiveArray<arrow::Int64Type>::from_arrow(null_arr);
+            result.type_ = array->type();  // preserve for Timestamp detection in to_velox
             return result;
         }
 
@@ -519,6 +520,7 @@ public:
         }
         result.residuals_ = LiquidPrimitiveArray<arrow::Int64Type>::from_arrow(
             bld.Finish().ValueOrDie());
+        result.type_ = array->type();  // preserve for Timestamp detection in to_velox
         return result;
     }
 
@@ -612,6 +614,7 @@ private:
     double intercept_ = 0.0;
     double slope_ = 0.0;
     LiquidPrimitiveArray<arrow::Int64Type> residuals_;
+    std::shared_ptr<arrow::DataType> type_;  // preserved for Timestamp detection in to_velox
 };
 
 using LiquidLinearI32Array = LiquidLinearIntegerArray<arrow::Int32Type>;

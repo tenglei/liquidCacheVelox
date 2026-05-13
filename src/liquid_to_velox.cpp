@@ -231,7 +231,54 @@ VectorPtr LiquidLinearIntegerArray<ArrowType>::to_velox(
             std::vector<BufferPtr>{});
     }
 
-    // All other types: direct reconstruction
+    // Check if this is actually a Timestamp stored via linear model
+    if (type_ && type_->id() == arrow::Type::TIMESTAMP) {
+        auto ts_type = std::static_pointer_cast<arrow::TimestampType>(type_);
+        switch (ts_type->unit()) {
+            case arrow::TimeUnit::SECOND: pt = PhysicalType::TimestampSecond; break;
+            case arrow::TimeUnit::MILLI:  pt = PhysicalType::TimestampMillisecond; break;
+            case arrow::TimeUnit::MICRO:  pt = PhysicalType::TimestampMicrosecond; break;
+            case arrow::TimeUnit::NANO:   pt = PhysicalType::TimestampNanosecond; break;
+            default: break;
+        }
+    }
+
+    // Timestamp types: decode int64 values, then convert to velox::Timestamp
+    if (pt == PhysicalType::TimestampSecond ||
+        pt == PhysicalType::TimestampMillisecond ||
+        pt == PhysicalType::TimestampMicrosecond ||
+        pt == PhysicalType::TimestampNanosecond) {
+
+        auto valuesBuf = AlignedBuffer::allocate<Timestamp>(static_cast<size_t>(len), pool);
+        auto* rawValues = valuesBuf->template asMutable<Timestamp>();
+        const int64_t* rd = res_typed->raw_values();
+        const uint8_t* rn = res_typed->null_bitmap_data();
+        int64_t ro = res_typed->offset();
+        constexpr int64_t mi = std::numeric_limits<int64_t>::min();
+        constexpr int64_t ma = std::numeric_limits<int64_t>::max();
+
+        for (int64_t i = 0; i < len; ++i) {
+            bool ok = !rn || arrow::bit_util::GetBit(rn, ro + i);
+            if (ok) {
+                double pr = slope_ * static_cast<double>(i) + intercept_;
+                int64_t p = predict_i64_saturated(pr, mi, ma);
+                __int128_t sum = static_cast<__int128_t>(p) + static_cast<__int128_t>(rd[i]);
+                int64_t val = static_cast<int64_t>(std::clamp<__int128_t>(sum,
+                    static_cast<__int128_t>(mi), static_cast<__int128_t>(ma)));
+                rawValues[i] = int64_to_velox_timestamp(val, pt);
+            } else {
+                rawValues[i] = Timestamp();
+            }
+        }
+
+        auto nulls = copy_null_bitmap_to_velox(residuals_.bit_packed(), pool);
+        return std::make_shared<FlatVector<Timestamp>>(
+            pool, TIMESTAMP(), nulls,
+            static_cast<vector_size_t>(len), valuesBuf,
+            std::vector<BufferPtr>{});
+    }
+
+    // All other types: direct reconstruction into NativeT buffer
     auto nulls = copy_null_bitmap_to_velox(residuals_.bit_packed(), pool);
     auto valuesBuf = AlignedBuffer::allocate<NativeT>(static_cast<size_t>(len), pool);
     auto* rawValues = valuesBuf->template asMutable<NativeT>();
@@ -248,9 +295,7 @@ VectorPtr LiquidLinearIntegerArray<ArrowType>::to_velox(
                 uint64_t p = predict_u64_saturated(pr, mx);
                 __int128_t sum = static_cast<__int128_t>(p) + static_cast<__int128_t>(rd[i]);
                 rawValues[i] = static_cast<NativeT>(std::clamp<__int128_t>(sum, __int128_t{0}, mx));
-            } else {
-                rawValues[i] = 0;
-            }
+            } else { rawValues[i] = 0; }
         }
     } else {
         constexpr int64_t mi = static_cast<int64_t>(std::numeric_limits<NativeT>::min());
@@ -263,9 +308,7 @@ VectorPtr LiquidLinearIntegerArray<ArrowType>::to_velox(
                 __int128_t sum = static_cast<__int128_t>(p) + static_cast<__int128_t>(rd[i]);
                 rawValues[i] = static_cast<NativeT>(std::clamp<__int128_t>(sum,
                     static_cast<__int128_t>(mi), static_cast<__int128_t>(ma)));
-            } else {
-                rawValues[i] = 0;
-            }
+            } else { rawValues[i] = 0; }
         }
     }
 
