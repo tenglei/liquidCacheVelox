@@ -420,27 +420,26 @@ private:
         return raw & mask;
     }
 
-    /// Scalar fallback: block-based with amortized offset calculation.
-    template <typename T>
-    void bulk_unpack_scalar_blocked(T* out) const {
+    /// Template-unrolled blocked unpack for auto-vectorization.
+    /// The compile-time constant BW lets the compiler eliminate branches
+    /// and auto-vectorize the inner loop (same approach as fastlanes).
+    template <uint8_t BW, typename T>
+    void bulk_unpack_blocked_t(T* out) const {
+        static_assert(BW > 0 && BW <= 32, "BW must be 1..32");
         const uint32_t n = length_;
-        const uint8_t bw = bit_width_;
-        const uint64_t mask = (bw < 64) ? ((1ULL << bw) - 1) : ~0ULL;
         const uint8_t* src = packed_data_.data();
         const size_t src_size = packed_data_.size();
+        constexpr uint64_t MASK = (BW < 64) ? ((1ULL << BW) - 1) : ~0ULL;
         constexpr uint32_t BLOCK = 64;
 
         for (uint32_t i = 0; i < n; i += BLOCK) {
             uint32_t end = std::min(i + BLOCK, n);
-            size_t bit_offset = static_cast<size_t>(i) * bw;
+            size_t bit_off = static_cast<size_t>(i) * BW;
             for (uint32_t j = i; j < end; ++j) {
-                size_t byte_idx = bit_offset / 8;
-                uint8_t bit_idx = bit_offset % 8;
+                size_t byte_idx = bit_off / 8;
+                uint8_t bit_idx = bit_off % 8;
                 uint64_t raw = 0;
-                if (bit_idx + bw <= 64 && byte_idx + 8 <= src_size) {
-                    std::memcpy(&raw, src + byte_idx, 8);
-                    raw >>= bit_idx;
-                } else if (bit_idx + bw <= 64) {
+                if (bit_idx + BW <= 64) {
                     size_t nread = std::min<size_t>(sizeof(uint64_t), src_size - byte_idx);
                     std::memcpy(&raw, src + byte_idx, nread);
                     raw >>= bit_idx;
@@ -455,8 +454,77 @@ private:
                     }
                     raw = (low >> bit_idx) | (high << (64 - bit_idx));
                 }
-                out[j] = static_cast<T>(raw & mask);
-                bit_offset += bw;
+                out[j] = static_cast<T>(raw & MASK);
+                bit_off += BW;
+            }
+        }
+    }
+
+    /// Scalar fallback with runtime width dispatch to template-unrolled paths.
+    /// Each width 1..31 gets compile-time-constant code enabling auto-vectorization.
+    template <typename T>
+    void bulk_unpack_scalar_blocked(T* out) const {
+        switch (bit_width_) {
+            case 1:  bulk_unpack_blocked_t<1>(out);  break;
+            case 2:  bulk_unpack_blocked_t<2>(out);  break;
+            case 3:  bulk_unpack_blocked_t<3>(out);  break;
+            case 5:  bulk_unpack_blocked_t<5>(out);  break;
+            case 6:  bulk_unpack_blocked_t<6>(out);  break;
+            case 7:  bulk_unpack_blocked_t<7>(out);  break;
+            case 9:  bulk_unpack_blocked_t<9>(out);  break;
+            case 10: bulk_unpack_blocked_t<10>(out); break;
+            case 11: bulk_unpack_blocked_t<11>(out); break;
+            case 12: bulk_unpack_blocked_t<12>(out); break;
+            case 13: bulk_unpack_blocked_t<13>(out); break;
+            case 14: bulk_unpack_blocked_t<14>(out); break;
+            case 15: bulk_unpack_blocked_t<15>(out); break;
+            case 17: bulk_unpack_blocked_t<17>(out); break;
+            case 18: bulk_unpack_blocked_t<18>(out); break;
+            case 19: bulk_unpack_blocked_t<19>(out); break;
+            case 20: bulk_unpack_blocked_t<20>(out); break;
+            case 21: bulk_unpack_blocked_t<21>(out); break;
+            case 22: bulk_unpack_blocked_t<22>(out); break;
+            case 23: bulk_unpack_blocked_t<23>(out); break;
+            case 24: bulk_unpack_blocked_t<24>(out); break;
+            case 25: bulk_unpack_blocked_t<25>(out); break;
+            case 26: bulk_unpack_blocked_t<26>(out); break;
+            case 27: bulk_unpack_blocked_t<27>(out); break;
+            case 28: bulk_unpack_blocked_t<28>(out); break;
+            case 29: bulk_unpack_blocked_t<29>(out); break;
+            case 30: bulk_unpack_blocked_t<30>(out); break;
+            case 31: bulk_unpack_blocked_t<31>(out); break;
+            default: {
+                // Widths > 31 or unexpected: run-time scalar path
+                const uint32_t n = length_;
+                const uint8_t* src = packed_data_.data();
+                const size_t src_size = packed_data_.size();
+                const uint64_t mask = (bit_width_ < 64) ? ((1ULL << bit_width_) - 1) : ~0ULL;
+                constexpr uint32_t BLOCK = 64;
+                for (uint32_t i = 0; i < n; i += BLOCK) {
+                    uint32_t end = std::min(i + BLOCK, n);
+                    size_t bit_off = static_cast<size_t>(i) * bit_width_;
+                    for (uint32_t j = i; j < end; ++j) {
+                        size_t byte_idx = bit_off / 8;
+                        uint8_t bit_idx = bit_off % 8;
+                        uint64_t raw = 0;
+                        if (bit_idx + bit_width_ <= 64 && byte_idx + 8 <= src_size) {
+                            std::memcpy(&raw, src + byte_idx, 8);
+                            raw >>= bit_idx;
+                        } else {
+                            uint64_t low = 0, high = 0;
+                            size_t avail = src_size - byte_idx;
+                            size_t lo = std::min<size_t>(8, avail);
+                            std::memcpy(&low, src + byte_idx, lo);
+                            if (avail > 8) {
+                                size_t hi = std::min<size_t>(avail - 8, sizeof(uint64_t));
+                                std::memcpy(&high, src + byte_idx + 8, hi);
+                            }
+                            raw = (low >> bit_idx) | (high << (64 - bit_idx));
+                        }
+                        out[j] = static_cast<T>(raw & mask);
+                        bit_off += bit_width_;
+                    }
+                }
             }
         }
     }
