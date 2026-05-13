@@ -787,17 +787,22 @@ public:
                 }
             }
 
-            // Fill patched positions with a fill value for better compression
-            SignedInt fill = encoded[0];
-            for (int64_t i = 0; i < len; ++i) {
-                bool is_patch = false;
-                for (auto pi : result.patch_indices_) {
-                    if (pi == static_cast<uint64_t>(i)) { is_patch = true; break; }
+            // Fill patched positions with a fill value for better compression.
+            // Guard: only fill if there is at least one non-patch value.
+            // If all values are patches, filling with garbage would corrupt
+            // the bit-packing range and produce wrong decoded values.
+            if (patch_count > 0 && static_cast<size_t>(len) > patch_count) {
+                SignedInt fill = encoded[0];
+                for (int64_t i = 0; i < len; ++i) {
+                    bool is_patch = false;
+                    for (auto pi : result.patch_indices_) {
+                        if (pi == static_cast<uint64_t>(i)) { is_patch = true; break; }
+                    }
+                    if (!is_patch) { fill = encoded[i]; break; }
                 }
-                if (!is_patch) { fill = encoded[i]; break; }
-            }
-            for (auto pi : result.patch_indices_) {
-                encoded[pi] = fill;
+                for (auto pi : result.patch_indices_) {
+                    encoded[pi] = fill;
+                }
             }
         }
 

@@ -760,6 +760,50 @@ TEST(Compression, StringSmallerThanOriginal) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// Regression: Float ALP all-patch fill-value corruption
+// When all sampled values are inexact for a given exponent pair,
+// the fill-value logic must NOT overwrite encoded data with garbage.
+// ═══════════════════════════════════════════════════════════════════════
+
+TEST(RoundtripFloat64, AllPatchFillRegression) {
+    // Values spanning extreme magnitudes to stress the exponent search
+    // and increase the likelihood of all-patch scenarios.
+    std::vector<double> vals;
+    vals.push_back(1e300);
+    vals.push_back(-1e300);
+    vals.push_back(1e-300);
+    vals.push_back(-1e-300);
+    vals.push_back(0.0);
+    vals.push_back(1.5);
+    vals.push_back(-2.5);
+    arrow::DoubleBuilder builder;
+    for (auto v : vals) APPEND(builder, v);
+    auto array = builder.Finish().ValueOrDie();
+
+    auto liquid = LiquidFloatArray<double>::from_arrow(array);
+    auto decoded = liquid.to_arrow();
+    assert_roundtrip(array, decoded);
+}
+
+TEST(RoundtripFloat32, AllPatchFillRegression) {
+    std::vector<float> vals;
+    vals.push_back(1e38f);
+    vals.push_back(-1e38f);
+    vals.push_back(1e-38f);
+    vals.push_back(-1e-38f);
+    vals.push_back(0.0f);
+    vals.push_back(1.5f);
+    vals.push_back(-2.5f);
+    arrow::FloatBuilder builder;
+    for (auto v : vals) APPEND(builder, v);
+    auto array = builder.Finish().ValueOrDie();
+
+    auto liquid = LiquidFloatArray<float>::from_arrow(array);
+    auto decoded = liquid.to_arrow();
+    assert_roundtrip(array, decoded);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Custom main() to initialize Arrow compute for static linking
 // ═══════════════════════════════════════════════════════════════════════
 
