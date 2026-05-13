@@ -158,14 +158,20 @@ public:
 
         result.reference_value_ = min_val;
 
-        // Compute offsets as unsigned
-        UnsignedT range = static_cast<UnsignedT>(max_val - min_val);
+        // Compute offsets as unsigned.  Cast to unsigned BEFORE subtraction
+        // to avoid signed-integer-overflow UB when min is near type::min
+        // and max is near type::max (e.g. INT32_MIN..INT32_MAX).
+        // Unsigned arithmetic wraps modulo 2^N by the C++ standard.
+        UnsignedT umin = static_cast<UnsignedT>(min_val);
+        UnsignedT umax = static_cast<UnsignedT>(max_val);
+        UnsignedT range = umax - umin;
         uint8_t bw = get_bit_width(static_cast<uint64_t>(range));
 
         std::vector<uint64_t> offsets(len);
         for (int64_t i = 0; i < len; ++i) {
             NativeT v = typed->Value(i);
-            offsets[i] = static_cast<uint64_t>(static_cast<UnsignedT>(v - min_val));
+            UnsignedT uv = static_cast<UnsignedT>(v);
+            offsets[i] = static_cast<uint64_t>(uv - umin);
         }
 
         // Build null bitmap

@@ -83,6 +83,27 @@ TEST(RoundtripInt32, Basic) {
 TEST(RoundtripInt64, Basic) {
     test_primitive_roundtrip<arrow::Int64Type>({0, 1000000000LL, -1000000000LL, INT64_MAX, INT64_MIN});
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Regression: extreme-range integer roundtrip (C++ signed overflow UB)
+// ═══════════════════════════════════════════════════════════════════════
+
+TEST(RoundtripInt32, ExtremeRange) {
+    test_primitive_roundtrip<arrow::Int32Type>({
+        INT32_MIN, INT32_MAX,
+        INT32_MIN + 1, INT32_MAX - 1,
+        0, -1, 1
+    });
+}
+
+TEST(RoundtripInt64, ExtremeRange) {
+    test_primitive_roundtrip<arrow::Int64Type>({
+        INT64_MIN, INT64_MAX,
+        INT64_MIN + 1, INT64_MAX - 1,
+        0, -1, 1
+    });
+}
+
 TEST(RoundtripUInt8, Basic) {
     test_primitive_roundtrip<arrow::UInt8Type>({0, 1, 127, 255, 42});
 }
