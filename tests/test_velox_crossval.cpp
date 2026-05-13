@@ -129,6 +129,117 @@ TEST(VeloxCrossVal, Date64) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// Null coverage for types missing it
+// ═══════════════════════════════════════════════════════════════════════
+
+TEST(VeloxCrossVal, Int8WithNulls) {
+    arrow::Int8Builder b;
+    APPEND(b, 0); APPEND_NULL(b); APPEND(b, 127); APPEND_NULL(b); APPEND(b, -128);
+    auto arr = b.Finish().ValueOrDie();
+    auto liquid = LiquidPrimitiveArray<arrow::Int8Type>::from_arrow(arr);
+    auto vec = liquid.to_velox(test_pool());
+    auto flat = vec->asFlatVector<int8_t>();
+    ASSERT_EQ(flat->size(), 5);
+    EXPECT_FALSE(flat->isNullAt(0)); EXPECT_EQ(flat->valueAt(0), 0);
+    EXPECT_TRUE(flat->isNullAt(1));
+    EXPECT_FALSE(flat->isNullAt(2)); EXPECT_EQ(flat->valueAt(2), 127);
+    EXPECT_TRUE(flat->isNullAt(3));
+    EXPECT_FALSE(flat->isNullAt(4)); EXPECT_EQ(flat->valueAt(4), -128);
+}
+
+TEST(VeloxCrossVal, Int16WithNulls) {
+    arrow::Int16Builder b;
+    APPEND(b, 0); APPEND_NULL(b); APPEND(b, 32767); APPEND_NULL(b); APPEND(b, -32768);
+    auto arr = b.Finish().ValueOrDie();
+    auto liquid = LiquidPrimitiveArray<arrow::Int16Type>::from_arrow(arr);
+    auto vec = liquid.to_velox(test_pool());
+    auto flat = vec->asFlatVector<int16_t>();
+    EXPECT_FALSE(flat->isNullAt(0)); EXPECT_TRUE(flat->isNullAt(1));
+    EXPECT_FALSE(flat->isNullAt(2)); EXPECT_TRUE(flat->isNullAt(3));
+}
+
+TEST(VeloxCrossVal, UInt8WithNulls) {
+    arrow::UInt8Builder b;
+    APPEND(b, 0); APPEND_NULL(b); APPEND(b, 255); APPEND_NULL(b); APPEND(b, 128);
+    auto arr = b.Finish().ValueOrDie();
+    auto liquid = LiquidPrimitiveArray<arrow::UInt8Type>::from_arrow(arr);
+    auto vec = liquid.to_velox(test_pool());
+    auto flat = vec->asFlatVector<uint8_t>();
+    EXPECT_FALSE(flat->isNullAt(0)); EXPECT_TRUE(flat->isNullAt(1));
+}
+
+TEST(VeloxCrossVal, UInt16WithNulls) {
+    arrow::UInt16Builder b;
+    APPEND(b, 0); APPEND_NULL(b); APPEND(b, 65535);
+    auto arr = b.Finish().ValueOrDie();
+    auto liquid = LiquidPrimitiveArray<arrow::UInt16Type>::from_arrow(arr);
+    auto vec = liquid.to_velox(test_pool());
+    auto flat = vec->asFlatVector<uint16_t>();
+    EXPECT_FALSE(flat->isNullAt(0)); EXPECT_TRUE(flat->isNullAt(1));
+}
+
+TEST(VeloxCrossVal, UInt32WithNulls) {
+    arrow::UInt32Builder b;
+    APPEND(b, 0); APPEND_NULL(b); APPEND(b, UINT32_MAX);
+    auto arr = b.Finish().ValueOrDie();
+    auto liquid = LiquidPrimitiveArray<arrow::UInt32Type>::from_arrow(arr);
+    auto vec = liquid.to_velox(test_pool());
+    auto flat = vec->asFlatVector<uint32_t>();
+    EXPECT_FALSE(flat->isNullAt(0)); EXPECT_TRUE(flat->isNullAt(1));
+}
+
+TEST(VeloxCrossVal, UInt64WithNulls) {
+    arrow::UInt64Builder b;
+    APPEND(b, 0); APPEND_NULL(b); APPEND(b, UINT64_MAX);
+    auto arr = b.Finish().ValueOrDie();
+    auto liquid = LiquidPrimitiveArray<arrow::UInt64Type>::from_arrow(arr);
+    auto vec = liquid.to_velox(test_pool());
+    auto flat = vec->asFlatVector<uint64_t>();
+    EXPECT_FALSE(flat->isNullAt(0)); EXPECT_TRUE(flat->isNullAt(1));
+}
+
+TEST(VeloxCrossVal, Date32WithNulls) {
+    arrow::Date32Builder b;
+    APPEND(b, 0); APPEND_NULL(b); APPEND(b, 19053);
+    auto arr = b.Finish().ValueOrDie();
+    auto liquid = LiquidPrimitiveArray<arrow::Date32Type>::from_arrow(arr);
+    auto vec = liquid.to_velox(test_pool());
+    auto flat = vec->asFlatVector<int32_t>();
+    EXPECT_FALSE(flat->isNullAt(0)); EXPECT_TRUE(flat->isNullAt(1));
+}
+
+TEST(VeloxCrossVal, Date64WithNulls) {
+    arrow::Date64Builder b;
+    APPEND(b, 0LL); APPEND_NULL(b); APPEND(b, 1648000000000LL);
+    auto arr = b.Finish().ValueOrDie();
+    auto liquid = LiquidPrimitiveArray<arrow::Date64Type>::from_arrow(arr);
+    auto vec = liquid.to_velox(test_pool());
+    auto flat = vec->asFlatVector<int32_t>();
+    EXPECT_FALSE(flat->isNullAt(0)); EXPECT_TRUE(flat->isNullAt(1));
+}
+
+TEST(VeloxCrossVal, BinaryWithNulls) {
+    arrow::BinaryBuilder b;
+    APPEND(b, "hello"); APPEND_NULL(b); APPEND(b, "world");
+    auto arr = b.Finish().ValueOrDie();
+    auto liquid = LiquidByteViewArray::from_arrow(arr);
+    auto vec = liquid.to_velox(test_pool());
+    auto flat = vec->asFlatVector<StringView>();
+    EXPECT_FALSE(flat->isNullAt(0)); EXPECT_TRUE(flat->isNullAt(1));
+}
+
+TEST(VeloxCrossVal, LinearInt64WithNulls) {
+    arrow::Int64Builder b;
+    APPEND(b, 100LL); APPEND_NULL(b); APPEND(b, 200LL); APPEND_NULL(b); APPEND(b, 300LL);
+    auto arr = b.Finish().ValueOrDie();
+    auto liquid = LiquidLinearIntegerArray<arrow::Int64Type>::from_arrow(arr);
+    auto vec = liquid.to_velox(test_pool());
+    auto flat = vec->asFlatVector<int64_t>();
+    EXPECT_FALSE(flat->isNullAt(0)); EXPECT_TRUE(flat->isNullAt(1));
+    EXPECT_FALSE(flat->isNullAt(2)); EXPECT_TRUE(flat->isNullAt(3));
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Timestamp cross-validation — all four time units
 // Verifies that LiquidPrimitiveArray<Int64Type>::to_velox() correctly
 // detects the stored TimestampType and produces TIMESTAMP (not BIGINT).
