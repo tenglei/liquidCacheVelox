@@ -1,2 +1,5 @@
 build/_deps/
 build/
+
+# Windows alternate data streams
+*:Zone.Identifier
