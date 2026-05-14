@@ -24,6 +24,7 @@
 #include "liquid_cache/liquid_fixed_len_byte_array.h"
 #include "liquid_cache/liquid_array.h"
 #include "liquid_cache/liquid_cache_store.h"
+#include "liquid_cache/compressor_states.h"
 
 namespace liquid_cache {
 
@@ -274,20 +275,15 @@ LiquidEncodedArray transcode_arrow_array(const std::shared_ptr<arrow::Array>& ar
                  value_type_id == arrow::Type::BINARY ||
                  value_type_id == arrow::Type::LARGE_STRING ||
                  value_type_id == arrow::Type::LARGE_BINARY)) {
-                // Decode dictionary to plain array via Cast, then encode as ByteViewArray
-                auto cast_result = arrow::compute::Cast(
-                    array, dict_type->value_type());
-                if (cast_result.ok()) {
-                    auto decoded = cast_result.ValueOrDie().make_array();
-                    auto liquid = LiquidByteViewArray::from_arrow(decoded);
-                    LiquidEncodedArray result;
-                    result.logical_type = LiquidDataType::ByteViewArray;
-                    result.physical_type = PhysicalType::Int8;
-                    result.serialized_bytes = liquid.to_bytes();
-                    result.length = liquid.length();
-                    result.memory_size = liquid.memory_size();
-                    return result;
-                }
+                // Direct encode from DictionaryArray — reuse Arrow's keys+values
+                auto liquid = LiquidByteViewArray::from_dict_array(array);
+                LiquidEncodedArray result;
+                result.logical_type = LiquidDataType::ByteViewArray;
+                result.physical_type = PhysicalType::Int8;
+                result.serialized_bytes = liquid.to_bytes();
+                result.length = liquid.length();
+                result.memory_size = liquid.memory_size();
+                return result;
             }
             // Unsupported dictionary type
             LiquidEncodedArray result;
@@ -611,17 +607,12 @@ LiquidArrayRef transcode_to_liquid_array(
                  value_type_id == arrow::Type::BINARY ||
                  value_type_id == arrow::Type::LARGE_STRING ||
                  value_type_id == arrow::Type::LARGE_BINARY)) {
-                auto cast_result = arrow::compute::Cast(
-                    array, dict_type->value_type());
-                if (cast_result.ok()) {
-                    auto decoded = cast_result.ValueOrDie().make_array();
-                    bool is_binary = (value_type_id == arrow::Type::BINARY ||
-                                      value_type_id == arrow::Type::LARGE_BINARY);
-                    PhysicalType phys = is_binary ? PhysicalType::UInt8 : PhysicalType::Int8;
-                    return make_liquid_array(
-                        LiquidByteViewArray::from_arrow(decoded),
-                        LiquidDataType::ByteViewArray, phys, orig_type);
-                }
+                bool is_binary = (value_type_id == arrow::Type::BINARY ||
+                                  value_type_id == arrow::Type::LARGE_BINARY);
+                PhysicalType phys = is_binary ? PhysicalType::UInt8 : PhysicalType::Int8;
+                return make_liquid_array(
+                    LiquidByteViewArray::from_dict_array(array),
+                    LiquidDataType::ByteViewArray, phys, orig_type);
             }
             return nullptr;
         }
@@ -654,6 +645,119 @@ LiquidArrayRef transcode_to_liquid_array(
 
         default:
             return nullptr;
+    }
+}
+
+/// Transcode with optional compressor states for FSST cross-batch reuse.
+/// Mirrors Rust's pattern: LiquidCompressorStates holds per-column FSST
+/// compressors that are trained on the first batch and reused for subsequent
+/// batches, avoiding redundant FSST training.
+LiquidArrayRef transcode_to_liquid_array(
+        const std::shared_ptr<arrow::Array>& array,
+        LiquidCompressorStates* states) {
+    auto orig_type = array->type();
+
+    switch (array->type_id()) {
+        // ── Types that use FSST ────────────────────────────────────
+        case arrow::Type::STRING:
+        case arrow::Type::LARGE_STRING:
+        case arrow::Type::BINARY:
+        case arrow::Type::LARGE_BINARY: {
+            bool is_binary = (array->type_id() == arrow::Type::BINARY ||
+                             array->type_id() == arrow::Type::LARGE_BINARY);
+            PhysicalType phys = is_binary ? PhysicalType::UInt8 : PhysicalType::Int8;
+
+            if (states) {
+                auto liquid = with_fsst_compressor_or_train(*states,
+                    [&](std::shared_ptr<FsstCompressor> comp) {
+                        return LiquidByteViewArray::from_arrow_with_compressor(
+                            array, *comp);
+                    },
+                    [&]() {
+                        auto lq = LiquidByteViewArray::from_arrow(array);
+                        auto comp = std::make_shared<FsstCompressor>(
+                            lq.get_compressor());
+                        return std::make_pair(std::move(comp), std::move(lq));
+                    });
+                return make_liquid_array(
+                    std::move(liquid), LiquidDataType::ByteViewArray,
+                    phys, orig_type);
+            }
+            return make_liquid_array(
+                LiquidByteViewArray::from_arrow(array),
+                LiquidDataType::ByteViewArray, phys, orig_type);
+        }
+
+        case arrow::Type::STRING_VIEW:
+        case arrow::Type::BINARY_VIEW:
+        case arrow::Type::DICTIONARY: {
+            if (!states) {
+                // Fall back to original single-arg path
+                return transcode_to_liquid_array(array);
+            }
+            // These types are cast to plain String/Binary first,
+            // then go through the same FSST reuse path.
+            // Use the original path which handles the casting internally.
+            return transcode_to_liquid_array(array);
+        }
+
+        case arrow::Type::DECIMAL128: {
+            if (LiquidDecimalArray::fits_u64(array)) {
+                return make_liquid_array(
+                    LiquidDecimalArray::from_arrow(array),
+                    LiquidDataType::Decimal, PhysicalType::UInt64, orig_type);
+            }
+            if (states) {
+                auto liquid = with_fsst_compressor_or_train(*states,
+                    [&](std::shared_ptr<FsstCompressor> comp) {
+                        return LiquidFixedLenByteArray::
+                            from_decimal128_with_compressor(array, *comp);
+                    },
+                    [&]() {
+                        auto lq = LiquidFixedLenByteArray::from_decimal128(array);
+                        auto comp = std::make_shared<FsstCompressor>(
+                            lq.get_compressor());
+                        return std::make_pair(std::move(comp), std::move(lq));
+                    });
+                return make_liquid_array(
+                    std::move(liquid), LiquidDataType::FixedLenByteArray,
+                    PhysicalType::UInt16, orig_type);
+            }
+            return make_liquid_array(
+                LiquidFixedLenByteArray::from_decimal128(array),
+                LiquidDataType::FixedLenByteArray, PhysicalType::UInt16, orig_type);
+        }
+
+        case arrow::Type::DECIMAL256: {
+            if (LiquidDecimalArray::fits_u64(array)) {
+                return make_liquid_array(
+                    LiquidDecimalArray::from_arrow(array),
+                    LiquidDataType::Decimal, PhysicalType::UInt64, orig_type);
+            }
+            if (states) {
+                auto liquid = with_fsst_compressor_or_train(*states,
+                    [&](std::shared_ptr<FsstCompressor> comp) {
+                        return LiquidFixedLenByteArray::
+                            from_decimal256_with_compressor(array, *comp);
+                    },
+                    [&]() {
+                        auto lq = LiquidFixedLenByteArray::from_decimal256(array);
+                        auto comp = std::make_shared<FsstCompressor>(
+                            lq.get_compressor());
+                        return std::make_pair(std::move(comp), std::move(lq));
+                    });
+                return make_liquid_array(
+                    std::move(liquid), LiquidDataType::FixedLenByteArray,
+                    PhysicalType::UInt16, orig_type);
+            }
+            return make_liquid_array(
+                LiquidFixedLenByteArray::from_decimal256(array),
+                LiquidDataType::FixedLenByteArray, PhysicalType::UInt16, orig_type);
+        }
+
+        // ── All other types: delegate to original function ─────────
+        default:
+            return transcode_to_liquid_array(array);
     }
 }
 
@@ -727,6 +831,104 @@ std::vector<LiquidCacheStore::RowGroupInfo> LiquidCacheStore::load_from_parquet(
                     entries_[key] = CacheEntry::from_liquid(std::move(liquid));
                 } else {
                     // Unsupported type: fall back to storing raw Arrow array
+                    entries_[key] = CacheEntry::from_arrow(batch->column(c));
+                }
+            }
+            ++batch_id;
+        }
+
+        rg_infos.push_back({file_id, rg_id, batch_id, rg_rows});
+        ++file_id;
+    }
+
+    auto t1 = std::chrono::steady_clock::now();
+    transcode_sec = std::chrono::duration<double>(t1 - t0).count();
+    return rg_infos;
+}
+
+/// New overload: automatic FSST compressor reuse across batches.
+/// Internally maintains per-column LiquidCompressorStates so that
+/// FSST training happens only on the first batch and is reused for
+/// all subsequent batches of the same column.
+std::vector<LiquidCacheStore::RowGroupInfo> LiquidCacheStore::load_from_parquet(
+        const std::vector<std::string>& files,
+        std::shared_ptr<arrow::Schema>& schema,
+        double& transcode_sec) {
+    std::vector<RowGroupInfo> rg_infos;
+    auto t0 = std::chrono::steady_clock::now();
+
+    // Per-column compressor states — trained lazily on first batch
+    std::vector<std::unique_ptr<LiquidCompressorStates>> compressor_states;
+
+    uint16_t file_id = 0;
+    for (const auto& path : files) {
+        auto maybe_infile = arrow::io::ReadableFile::Open(path);
+        if (!maybe_infile.ok()) { ++file_id; continue; }
+        auto infile = maybe_infile.ValueOrDie();
+
+        std::unique_ptr<parquet::arrow::FileReader> reader;
+#if ARROW_VERSION_MAJOR >= 19
+        auto open_result = parquet::arrow::OpenFile(
+            infile, arrow::default_memory_pool());
+        if (!open_result.ok()) { ++file_id; continue; }
+        reader = std::move(open_result).ValueOrDie();
+#else
+        auto open_status = parquet::arrow::OpenFile(
+            infile, arrow::default_memory_pool(), &reader);
+        if (!open_status.ok()) { ++file_id; continue; }
+#endif
+        reader->set_batch_size(8192);
+
+        if (!schema) {
+            std::shared_ptr<arrow::Schema> file_schema;
+            auto schema_status = reader->GetSchema(&file_schema);
+            if (schema_status.ok()) {
+                schema = file_schema;
+                // Initialize compressor states once we know column count
+                int ncols = schema->num_fields();
+                compressor_states.reserve(ncols);
+                for (int i = 0; i < ncols; ++i)
+                    compressor_states.push_back(std::make_unique<LiquidCompressorStates>());
+            }
+        }
+
+        std::shared_ptr<arrow::RecordBatchReader> batch_reader;
+#if ARROW_VERSION_MAJOR >= 19
+        auto rb_result = reader->GetRecordBatchReader();
+        if (!rb_result.ok()) { ++file_id; continue; }
+        batch_reader = std::move(rb_result).ValueOrDie();
+#else
+        auto rb_status = reader->GetRecordBatchReader(&batch_reader);
+        if (!rb_status.ok()) { ++file_id; continue; }
+#endif
+
+        uint16_t rg_id = 0;
+        uint16_t batch_id = 0;
+        size_t rg_rows = 0;
+
+        while (true) {
+            std::shared_ptr<arrow::RecordBatch> batch;
+            auto st = batch_reader->ReadNext(&batch);
+            if (!st.ok() || !batch) break;
+
+            rg_rows += batch->num_rows();
+
+            for (int c = 0; c < batch->num_columns(); ++c) {
+                LiquidCacheKey key(file_id, rg_id,
+                                   static_cast<uint16_t>(c), batch_id);
+
+                // Use per-column compressor state for FSST reuse
+                LiquidCompressorStates* states = nullptr;
+                if (c < static_cast<int>(compressor_states.size())) {
+                    states = compressor_states[c].get();
+                }
+                auto liquid = transcode_to_liquid_array(
+                    batch->column(c), states);
+
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (liquid) {
+                    entries_[key] = CacheEntry::from_liquid(std::move(liquid));
+                } else {
                     entries_[key] = CacheEntry::from_arrow(batch->column(c));
                 }
             }

@@ -11,6 +11,25 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 option(LIQUID_ENABLE_VELOX "Enable Velox vector integration" OFF)
 set(VELOX_PREFIX "" CACHE STRING "Velox build directory (e.g. /path/to/velox/build)")
 
+option(LIQUID_ENABLE_SIMD "Enable AVX2/BMI2 SIMD acceleration for BitPacking" ON)
+
+# Check for SIMD compiler support
+if(LIQUID_ENABLE_SIMD)
+    include(CheckCXXCompilerFlag)
+    check_cxx_compiler_flag(-mavx2 COMPILER_SUPPORTS_AVX2)
+    check_cxx_compiler_flag(-mbmi2 COMPILER_SUPPORTS_BMI2)
+    if(COMPILER_SUPPORTS_AVX2 AND COMPILER_SUPPORTS_BMI2)
+        set(LIQUID_SIMD_FLAGS -mavx2 -mbmi2)
+        message(STATUS "SIMD acceleration enabled: AVX2 + BMI2")
+    else()
+        set(LIQUID_SIMD_FLAGS "")
+        message(STATUS "SIMD acceleration disabled: compiler lacks AVX2/BMI2 support")
+    endif()
+else()
+    set(LIQUID_SIMD_FLAGS "")
+    message(STATUS "SIMD acceleration disabled by user")
+endif()
+
 # ── Find Dependencies ──────────────────────────────────────────────
 find_package(Threads REQUIRED)
 find_package(Arrow REQUIRED)
@@ -211,6 +230,10 @@ else()
             ${Arrow_INCLUDE_DIR}
             ${Parquet_INCLUDE_DIR}
     )
+    if(LIQUID_SIMD_FLAGS)
+        target_compile_options(liquid_cache_core PRIVATE ${LIQUID_SIMD_FLAGS})
+        target_compile_definitions(liquid_cache_core PRIVATE __AVX2__)
+    endif()
 endif()
 
 # ══════════════════════════════════════════════════════════════════
@@ -456,6 +479,23 @@ else()
 endif()
 
 # ══════════════════════════════════════════════════════════════════
+# Target 6: bench_bit_packed  (microbenchmark)
+# ══════════════════════════════════════════════════════════════════
+add_executable(bench_bit_packed
+    tools/bench_bit_packed.cpp
+)
+target_include_directories(bench_bit_packed PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${Arrow_INCLUDE_DIR}
+)
+target_link_libraries(bench_bit_packed PRIVATE
+    liquid_cache_core
+    ${STATIC_LINK_LIBS}
+)
+target_compile_options(bench_bit_packed PRIVATE -O2)
+add_dependencies(bench_bit_packed liquid_cache_core)
+
+# ══════════════════════════════════════════════════════════════════
 # Testing (Google Test via FetchContent)
 # ══════════════════════════════════════════════════════════════════
 option(LIQUID_BUILD_TESTS "Build unit tests" ON)
@@ -494,6 +534,10 @@ if(LIQUID_BUILD_TESTS)
             ${Arrow_INCLUDE_DIR}
             ${Parquet_INCLUDE_DIR}
         )
+        if(LIQUID_SIMD_FLAGS)
+            target_compile_options(liquid_cache_tests PRIVATE ${LIQUID_SIMD_FLAGS})
+            target_compile_definitions(liquid_cache_tests PRIVATE __AVX2__)
+        endif()
         target_link_libraries(liquid_cache_tests PRIVATE
             liquid_cache_core
             ${STATIC_LINK_LIBS}
@@ -623,6 +667,10 @@ if(LIQUID_BUILD_TESTS)
     target_include_directories(liquid_bit_packed_test PRIVATE
         ${CMAKE_SOURCE_DIR}/include
     )
+    if(LIQUID_SIMD_FLAGS)
+        target_compile_options(liquid_bit_packed_test PRIVATE ${LIQUID_SIMD_FLAGS})
+        target_compile_definitions(liquid_bit_packed_test PRIVATE __AVX2__)
+    endif()
     target_link_libraries(liquid_bit_packed_test PRIVATE
         GTest::gtest_main
     )

@@ -263,80 +263,7 @@ public:
             }
         }
 
-        // Step 2: Compute shared prefix
-        if (!dict_values.empty()) {
-            result.shared_prefix_.assign(
-                dict_values[0].begin(), dict_values[0].end());
-            for (size_t d = 1; d < dict_values.size(); ++d) {
-                size_t match_len = 0;
-                size_t max_check = std::min(
-                    result.shared_prefix_.size(), dict_values[d].size());
-                while (match_len < max_check &&
-                       result.shared_prefix_[match_len] ==
-                       static_cast<uint8_t>(dict_values[d][match_len])) {
-                    ++match_len;
-                }
-                result.shared_prefix_.resize(match_len);
-            }
-        }
-        size_t sp_len = result.shared_prefix_.size();
-
-        // Step 3: FSST compress dictionary values (minus shared prefix)
-        // Concatenate all suffixes for training
-        std::vector<uint8_t> all_suffixes;
-        std::vector<uint32_t> suffix_offsets;
-        suffix_offsets.push_back(0);
-        for (auto& dv : dict_values) {
-            size_t suffix_len = dv.size() >= sp_len ? dv.size() - sp_len : 0;
-            const uint8_t* suffix_data =
-                reinterpret_cast<const uint8_t*>(dv.data()) + sp_len;
-            all_suffixes.insert(all_suffixes.end(),
-                                suffix_data, suffix_data + suffix_len);
-            suffix_offsets.push_back(static_cast<uint32_t>(all_suffixes.size()));
-        }
-
-        // Train FSST on all suffix data
-        result.compressor_.train(all_suffixes.data(), all_suffixes.size());
-
-        // Compress each suffix individually and build offsets
-        std::vector<uint8_t> compressed_buffer;
-        std::vector<uint32_t> compressed_offsets;
-        compressed_offsets.push_back(0);
-
-        for (size_t d = 0; d < dict_values.size(); ++d) {
-            uint32_t start = suffix_offsets[d];
-            uint32_t end = suffix_offsets[d + 1];
-            auto compressed = result.compressor_.compress(
-                all_suffixes.data() + start, end - start);
-            compressed_buffer.insert(compressed_buffer.end(),
-                                     compressed.begin(), compressed.end());
-            compressed_offsets.push_back(
-                static_cast<uint32_t>(compressed_buffer.size()));
-        }
-
-        result.uncompressed_bytes_ = all_suffixes.size();
-        result.compressed_data_ = std::move(compressed_buffer);
-        result.compact_offsets_ = CompactOffsets(compressed_offsets);
-
-        // Step 4: Build prefix keys
-        for (auto& dv : dict_values) {
-            size_t suffix_len = dv.size() >= sp_len ? dv.size() - sp_len : 0;
-            const uint8_t* suffix = reinterpret_cast<const uint8_t*>(
-                dv.data()) + sp_len;
-            result.prefix_keys_.emplace_back(suffix, suffix_len);
-        }
-
-        // Step 5: Pack dictionary keys into BitPackedArray
-        uint16_t max_key = dict_values.empty() ? 0 :
-            static_cast<uint16_t>(dict_values.size() - 1);
-        uint8_t bw = get_bit_width(static_cast<uint64_t>(max_key));
-
-        std::vector<uint64_t> key_offsets(len);
-        for (int64_t i = 0; i < len; ++i) {
-            key_offsets[i] = static_cast<uint64_t>(keys[i]);
-        }
-
-        // Build null bitmap
+        // Step 2: Shared prefix → FSST → PrefixKeys → BitPackedArray
         const uint8_t* null_bitmap = nullptr;
         std::vector<uint8_t> null_bits;
         if (array->null_count() > 0 && array->null_bitmap()) {
@@ -345,10 +272,153 @@ public:
                              array->null_bitmap()->data() + bitmap_bytes);
             null_bitmap = null_bits.data();
         }
+        build_encoded_dict(result, dict_values, keys.data(), null_bitmap, len);
+        return result;
+    }
 
-        result.dictionary_keys_ = BitPackedArray(
-            key_offsets.data(), null_bitmap, static_cast<uint32_t>(len), bw);
+    /// Encode directly from an Arrow DictionaryArray with UInt16 keys.
+    /// Reuses Arrow's existing dictionary values and keys unchanged,
+    /// avoiding the round-trip through flat StringArray + hash map rebuild.
+    /// This is the fast path for Parquet dictionary-encoded string columns.
+    static LiquidByteViewArray from_dict_array(
+            const std::shared_ptr<arrow::Array>& array) {
+        auto dict_array = std::static_pointer_cast<arrow::DictionaryArray>(array);
+        LiquidByteViewArray result;
+        auto dict_type = dict_array->dict_type();
+        auto value_type_id = dict_type->value_type()->id();
+        result.is_binary_ = (value_type_id == arrow::Type::BINARY ||
+                             value_type_id == arrow::Type::LARGE_BINARY);
+        const int64_t len = dict_array->length();
 
+        // Step 1: Extract dictionary values (already unique, no hash map needed)
+        auto values_array = dict_array->dictionary();
+        int64_t dict_size = values_array->length();
+        std::vector<std::string> dict_values(dict_size);
+
+        auto get_dict_value = [&](int64_t i, const uint8_t*& data, uint32_t& length) {
+            if (value_type_id == arrow::Type::STRING) {
+                auto sa = std::static_pointer_cast<arrow::StringArray>(values_array);
+                int32_t vlen;
+                data = sa->GetValue(i, &vlen);
+                length = static_cast<uint32_t>(vlen);
+            } else if (value_type_id == arrow::Type::LARGE_STRING) {
+                auto sa = std::static_pointer_cast<arrow::LargeStringArray>(values_array);
+                int64_t vlen;
+                data = sa->GetValue(i, &vlen);
+                length = static_cast<uint32_t>(vlen);
+            } else if (value_type_id == arrow::Type::BINARY) {
+                auto ba = std::static_pointer_cast<arrow::BinaryArray>(values_array);
+                int32_t vlen;
+                data = ba->GetValue(i, &vlen);
+                length = static_cast<uint32_t>(vlen);
+            } else {
+                auto ba = std::static_pointer_cast<arrow::LargeBinaryArray>(values_array);
+                int64_t vlen;
+                data = ba->GetValue(i, &vlen);
+                length = static_cast<uint32_t>(vlen);
+            }
+        };
+
+        for (int64_t d = 0; d < dict_size; ++d) {
+            if (values_array->IsNull(d)) {
+                dict_values[d].clear();
+                continue;
+            }
+            const uint8_t* data;
+            uint32_t vlen;
+            get_dict_value(d, data, vlen);
+            dict_values[d].assign(reinterpret_cast<const char*>(data), vlen);
+        }
+
+        // Step 2: Extract keys from Arrow indices (already uint16)
+        auto indices_array = std::static_pointer_cast<arrow::UInt16Array>(
+            dict_array->indices());
+        const uint16_t* raw_indices = indices_array->raw_values();
+
+        std::vector<uint16_t> keys(len);
+        for (int64_t i = 0; i < len; ++i) {
+            keys[i] = dict_array->IsNull(i) ? 0 : raw_indices[i];
+        }
+
+        // Step 3: Shared prefix → FSST → PrefixKeys → BitPackedArray
+        build_encoded_dict(result, dict_values, keys.data(),
+                          array->null_bitmap_data(), len);
+        return result;
+    }
+
+    /// Encode using a pre-trained FSST compressor (avoids retraining per batch).
+    /// Mirrors Rust's from_byte_array_inner() which takes Arc<Compressor>.
+    static LiquidByteViewArray from_arrow_with_compressor(
+            const std::shared_ptr<arrow::Array>& array,
+            const FsstCompressor& compressor) {
+        LiquidByteViewArray result;
+        result.is_binary_ = (array->type_id() == arrow::Type::BINARY ||
+                             array->type_id() == arrow::Type::LARGE_BINARY);
+        result.compressor_ = compressor;  // copy pre-trained compressor
+        const int64_t len = array->length();
+
+        // Step 1: Build dictionary (deduplicate strings)
+        std::unordered_map<std::string, uint16_t> dict_map;
+        std::vector<std::string> dict_values;
+        std::vector<uint16_t> keys(len);
+
+        auto get_value = [&](int64_t i, const uint8_t*& data, uint32_t& length) {
+            if (array->type_id() == arrow::Type::STRING) {
+                auto sa = std::static_pointer_cast<arrow::StringArray>(array);
+                int32_t vlen;
+                data = sa->GetValue(i, &vlen);
+                length = static_cast<uint32_t>(vlen);
+            } else if (array->type_id() == arrow::Type::LARGE_STRING) {
+                auto sa = std::static_pointer_cast<arrow::LargeStringArray>(array);
+                int64_t vlen;
+                data = sa->GetValue(i, &vlen);
+                length = static_cast<uint32_t>(vlen);
+            } else if (array->type_id() == arrow::Type::BINARY) {
+                auto ba = std::static_pointer_cast<arrow::BinaryArray>(array);
+                int32_t vlen;
+                data = ba->GetValue(i, &vlen);
+                length = static_cast<uint32_t>(vlen);
+            } else {
+                auto ba = std::static_pointer_cast<arrow::LargeBinaryArray>(array);
+                int64_t vlen;
+                data = ba->GetValue(i, &vlen);
+                length = static_cast<uint32_t>(vlen);
+            }
+        };
+
+        for (int64_t i = 0; i < len; ++i) {
+            if (array->IsNull(i)) {
+                keys[i] = 0;
+                continue;
+            }
+            const uint8_t* data;
+            uint32_t vlen;
+            get_value(i, data, vlen);
+            std::string val(reinterpret_cast<const char*>(data), vlen);
+
+            auto it = dict_map.find(val);
+            if (it != dict_map.end()) {
+                keys[i] = it->second;
+            } else {
+                uint16_t idx = static_cast<uint16_t>(dict_values.size());
+                dict_map[val] = idx;
+                dict_values.push_back(std::move(val));
+                keys[i] = idx;
+            }
+        }
+
+        // Step 2: Shared prefix → FSST → PrefixKeys → BitPackedArray
+        // (compressor already set above, passed to skip training)
+        const uint8_t* null_bitmap = nullptr;
+        std::vector<uint8_t> null_bits;
+        if (array->null_count() > 0 && array->null_bitmap()) {
+            size_t bitmap_bytes = (len + 7) / 8;
+            null_bits.assign(array->null_bitmap()->data(),
+                             array->null_bitmap()->data() + bitmap_bytes);
+            null_bitmap = null_bits.data();
+        }
+        build_encoded_dict(result, dict_values, keys.data(), null_bitmap, len,
+                          &result.compressor_);
         return result;
     }
 
@@ -569,12 +639,19 @@ public:
         return result;
     }
 
+public:
     uint32_t length() const { return dictionary_keys_.length(); }
     size_t memory_size() const {
         return compressed_data_.size() + shared_prefix_.size() +
                dictionary_keys_.memory_size() +
                prefix_keys_.size() * 8 + sizeof(*this);
     }
+
+    /// Access the FSST compressor (e.g., for cross-batch reuse).
+    const FsstCompressor& get_compressor() const { return compressor_; }
+
+    /// Mutable compressor access for internal use.
+    FsstCompressor& mutable_compressor() { return compressor_; }
 
 #ifdef LIQUID_ENABLE_VELOX
     /// Decode directly to Velox FlatVector<StringView>.
@@ -583,6 +660,94 @@ public:
 #endif
 
 private:
+    /// Shared encoding tail: given already-built unique dict_values and
+    /// per-element uint16 keys, compute shared prefix, compress via FSST,
+    /// build PrefixKeys, and pack keys into BitPackedArray.
+    /// If `compressor` is non-null, it is used directly (no training).
+    /// Otherwise a fresh FSST compressor is trained on the suffix data.
+    static void build_encoded_dict(
+            LiquidByteViewArray& result,
+            const std::vector<std::string>& dict_values,
+            const uint16_t* keys,
+            const uint8_t* null_bitmap_data,
+            int64_t len,
+            const FsstCompressor* compressor = nullptr) {
+        // Step A: Compute shared prefix
+        if (!dict_values.empty()) {
+            result.shared_prefix_.assign(
+                dict_values[0].begin(), dict_values[0].end());
+            for (size_t d = 1; d < dict_values.size(); ++d) {
+                size_t match_len = 0;
+                size_t max_check = std::min(
+                    result.shared_prefix_.size(), dict_values[d].size());
+                while (match_len < max_check &&
+                       result.shared_prefix_[match_len] ==
+                       static_cast<uint8_t>(dict_values[d][match_len])) {
+                    ++match_len;
+                }
+                result.shared_prefix_.resize(match_len);
+            }
+        }
+        size_t sp_len = result.shared_prefix_.size();
+
+        // Step B: Concatenate suffix bytes
+        std::vector<uint8_t> all_suffixes;
+        std::vector<uint32_t> suffix_offsets;
+        suffix_offsets.push_back(0);
+        for (auto& dv : dict_values) {
+            size_t suffix_len = dv.size() >= sp_len ? dv.size() - sp_len : 0;
+            const uint8_t* suffix_data =
+                reinterpret_cast<const uint8_t*>(dv.data()) + sp_len;
+            all_suffixes.insert(all_suffixes.end(),
+                                suffix_data, suffix_data + suffix_len);
+            suffix_offsets.push_back(static_cast<uint32_t>(all_suffixes.size()));
+        }
+
+        // Step C: Train FSST (skip if compressor provided)
+        if (compressor) {
+            result.compressor_ = *compressor;
+        } else {
+            result.compressor_.train(all_suffixes.data(), all_suffixes.size());
+        }
+
+        // Step D: Compress each suffix and build CompactOffsets
+        std::vector<uint8_t> compressed_buffer;
+        std::vector<uint32_t> compressed_offsets;
+        compressed_offsets.push_back(0);
+        for (size_t d = 0; d < dict_values.size(); ++d) {
+            uint32_t start = suffix_offsets[d];
+            uint32_t end = suffix_offsets[d + 1];
+            auto compressed = result.compressor_.compress(
+                all_suffixes.data() + start, end - start);
+            compressed_buffer.insert(compressed_buffer.end(),
+                                     compressed.begin(), compressed.end());
+            compressed_offsets.push_back(
+                static_cast<uint32_t>(compressed_buffer.size()));
+        }
+        result.uncompressed_bytes_ = all_suffixes.size();
+        result.compressed_data_ = std::move(compressed_buffer);
+        result.compact_offsets_ = CompactOffsets(compressed_offsets);
+
+        // Step E: Build prefix keys
+        for (auto& dv : dict_values) {
+            size_t suffix_len = dv.size() >= sp_len ? dv.size() - sp_len : 0;
+            const uint8_t* suffix = reinterpret_cast<const uint8_t*>(
+                dv.data()) + sp_len;
+            result.prefix_keys_.emplace_back(suffix, suffix_len);
+        }
+
+        // Step F: BitPackedArray for keys
+        uint16_t max_key = dict_values.empty() ? 0 :
+            static_cast<uint16_t>(dict_values.size() - 1);
+        uint8_t bw = get_bit_width(static_cast<uint64_t>(max_key));
+        std::vector<uint64_t> key_offsets(len);
+        for (int64_t i = 0; i < len; ++i) {
+            key_offsets[i] = static_cast<uint64_t>(keys[i]);
+        }
+        result.dictionary_keys_ = BitPackedArray(
+            key_offsets.data(), null_bitmap_data, static_cast<uint32_t>(len), bw);
+    }
+
     static void pad_to_8(std::vector<uint8_t>& out) {
         while (out.size() % 8 != 0) out.push_back(0);
     }

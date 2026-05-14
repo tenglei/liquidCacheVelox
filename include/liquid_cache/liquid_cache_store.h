@@ -365,7 +365,7 @@ public:
         size_t total_rows;
     };
 
-    /// Load Parquet files into the cache, transcoding each column to Liquid format.
+    /// Load Parquet files with customizable transcoding (original overload).
     ///
     /// Returns metadata about each row group loaded, and sets transcode_sec
     /// to the total transcoding time.
@@ -381,6 +381,22 @@ public:
             double& transcode_sec,
             const std::function<LiquidArrayRef(
                 const std::shared_ptr<arrow::Array>&)>& transcode_fn);
+
+    /// Load Parquet files with automatic FSST compressor reuse.
+    ///
+    /// This overload internally manages per-column LiquidCompressorStates,
+    /// mirroring Rust's pattern of training FSST once per column and reusing
+    /// the compressor across all batches. This is the recommended path
+    /// for workloads with string or large decimal columns.
+    ///
+    /// @param files          Parquet file paths
+    /// @param schema         Output: table schema from first file
+    /// @param transcode_sec  Output: total transcoding time in seconds
+    /// @return Vector of RowGroupInfo for all loaded row groups
+    std::vector<RowGroupInfo> load_from_parquet(
+            const std::vector<std::string>& files,
+            std::shared_ptr<arrow::Schema>& schema,
+            double& transcode_sec);
 
     // ── Statistics ───────────────────────────────────────────────────
 

@@ -129,6 +129,23 @@ public:
         return result;
     }
 
+    /// Encode using a pre-trained FSST compressor.
+    static LiquidFixedLenByteArray from_decimal128_with_compressor(
+            const std::shared_ptr<arrow::Array>& array,
+            const FsstCompressor& compressor) {
+        auto dec_arr = std::static_pointer_cast<arrow::Decimal128Array>(array);
+        auto dec_type = std::static_pointer_cast<arrow::Decimal128Type>(array->type());
+
+        LiquidFixedLenByteArray result;
+        result.arrow_type_ = ArrowFixedLenByteArrayType::Decimal128;
+        result.precision_ = static_cast<uint8_t>(dec_type->precision());
+        result.scale_ = static_cast<int8_t>(dec_type->scale());
+        result.compressor_ = compressor;  // set BEFORE so training is skipped
+
+        build_dictionary_and_compress(dec_arr, 16, result);
+        return result;
+    }
+
     /// Encode a Decimal256Array (dictionary + FSST).
     static LiquidFixedLenByteArray from_decimal256(
             const std::shared_ptr<arrow::Array>& array) {
@@ -139,6 +156,23 @@ public:
         result.arrow_type_ = ArrowFixedLenByteArrayType::Decimal256;
         result.precision_ = static_cast<uint8_t>(dec_type->precision());
         result.scale_ = static_cast<int8_t>(dec_type->scale());
+
+        build_dictionary_and_compress(dec_arr, 32, result);
+        return result;
+    }
+
+    /// Encode Decimal256 using a pre-trained FSST compressor.
+    static LiquidFixedLenByteArray from_decimal256_with_compressor(
+            const std::shared_ptr<arrow::Array>& array,
+            const FsstCompressor& compressor) {
+        auto dec_arr = std::static_pointer_cast<arrow::Decimal256Array>(array);
+        auto dec_type = std::static_pointer_cast<arrow::Decimal256Type>(array->type());
+
+        LiquidFixedLenByteArray result;
+        result.arrow_type_ = ArrowFixedLenByteArrayType::Decimal256;
+        result.precision_ = static_cast<uint8_t>(dec_type->precision());
+        result.scale_ = static_cast<int8_t>(dec_type->scale());
+        result.compressor_ = compressor;  // set BEFORE so training is skipped
 
         build_dictionary_and_compress(dec_arr, 32, result);
         return result;
@@ -289,6 +323,9 @@ public:
                compact_offsets_bytes_ + sizeof(*this);
     }
 
+    /// Access the FSST compressor (e.g., for cross-batch reuse).
+    const FsstCompressor& get_compressor() const { return compressor_; }
+
     /// Check if a Decimal128Array's values do NOT fit in uint64.
     static bool needs_fixed_len(const std::shared_ptr<arrow::Array>& array) {
         return !LiquidDecimalArray::fits_u64(array);
@@ -389,7 +426,10 @@ private:
         }
 
         // Step 3: Train FSST compressor on the concatenated bytes
-        result.compressor_.train(all_bytes.data(), all_bytes.size());
+        // Skip if compressor was pre-set (e.g., from cross-batch reuse)
+        if (result.compressor_.symbol_count() == 0) {
+            result.compressor_.train(all_bytes.data(), all_bytes.size());
+        }
 
         // Step 4: Compress each unique value individually, track offsets
         result.value_offsets_.push_back(0);

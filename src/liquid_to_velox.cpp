@@ -11,6 +11,8 @@
 #include "liquid_cache/liquid_fixed_len_byte_array.h"
 #include "liquid_cache/liquid_cache_store.h"
 
+#include "velox/vector/DictionaryVector.h"
+
 namespace liquid_cache {
 
 using namespace facebook::velox;
@@ -334,19 +336,19 @@ template VectorPtr LiquidLinearIntegerArray<arrow::Date64Type>::to_velox(memory:
 // ═══════════════════════════════════════════════════════════════════════
 // LiquidByteViewArray::to_velox()
 //
-// Decodes FSST + Dictionary + BitPacking directly to
-// Velox FlatVector<StringView>.
+// Decodes FSST + Dictionary + BitPacking directly to Velox.
 //
-// Key optimization: reuses ensure_dict_cached() so FSST dictionary
-// decompression happens only once and is cached across iterations.
+// For low-cardinality dictionaries (dict_size < len/2), outputs
+// DictionaryVector<StringView> to avoid per-element string copies.
+// For high-cardinality, falls back to FlatVector<StringView>.
 // ═══════════════════════════════════════════════════════════════════════
 
 VectorPtr LiquidByteViewArray::to_velox(
         memory::MemoryPool* pool) const {
     uint32_t len = dictionary_keys_.length();
+    TypePtr veloxType = is_binary_ ? TypePtr(VARBINARY()) : TypePtr(VARCHAR());
     if (len == 0) {
-        TypePtr emptyType = is_binary_ ? TypePtr(VARBINARY()) : TypePtr(VARCHAR());
-        return BaseVector::create(emptyType, 0, pool);
+        return BaseVector::create(veloxType, 0, pool);
     }
 
     // Phase A: Get cached decompressed dictionary (lazy, one-time FSST decode)
@@ -360,6 +362,54 @@ VectorPtr LiquidByteViewArray::to_velox(
     std::vector<uint16_t> keys(len);
     dictionary_keys_.bulk_unpack_to(keys.data());
 
+    auto nulls = copy_null_bitmap_to_velox(dictionary_keys_, pool);
+
+    // ── DictionaryVector path for low-cardinality dictionaries ────────
+    // When the dictionary is significantly smaller than the array,
+    // output a DictionaryVector<StringView> instead of copying strings
+    // into a FlatVector.  This avoids O(N) memcpy per decode.
+    if (dict_size > 0 && dict_size < len / 2) {
+        // Build the base FlatVector<StringView> from dictionary entries.
+        // Compute total bytes for dictionary strings (not per-element).
+        int64_t dict_total_bytes = 0;
+        for (size_t d = 0; d < dict_size; ++d) {
+            dict_total_bytes += dict_lens[d];
+        }
+
+        auto dictStringBuf = AlignedBuffer::allocate<char>(
+            dict_total_bytes, pool);
+        auto dictValuesBuf = AlignedBuffer::allocate<StringView>(
+            static_cast<vector_size_t>(dict_size), pool);
+        auto* dictRawStrings = dictStringBuf->template asMutable<char>();
+        auto* dictRawViews  = dictValuesBuf->template asMutable<StringView>();
+
+        int64_t dict_off = 0;
+        for (size_t d = 0; d < dict_size; ++d) {
+            int32_t entry_len = dict_lens[d];
+            std::memcpy(dictRawStrings + dict_off,
+                        dict_flat + dict_flat_offsets[d], entry_len);
+            dictRawViews[d] = StringView(dictRawStrings + dict_off, entry_len);
+            dict_off += entry_len;
+        }
+
+        auto dictVec = std::make_shared<FlatVector<StringView>>(
+            pool, veloxType, nullptr,
+            static_cast<vector_size_t>(dict_size), dictValuesBuf,
+            std::vector<BufferPtr>{dictStringBuf});
+
+        // Convert uint16 keys to vector_size_t indices.
+        auto indices = AlignedBuffer::allocate<vector_size_t>(
+            static_cast<vector_size_t>(len), pool);
+        auto* rawIndices = indices->template asMutable<vector_size_t>();
+        for (uint32_t i = 0; i < len; ++i) {
+            rawIndices[i] = static_cast<vector_size_t>(keys[i]);
+        }
+
+        return std::make_shared<DictionaryVector<StringView>>(
+            pool, nulls, static_cast<vector_size_t>(len), dictVec, indices);
+    }
+
+    // ── FlatVector path for high-cardinality dictionaries ─────────────
     // Phase C: Pass 1 — compute total string bytes
     int64_t total_string_bytes = 0;
     for (uint32_t i = 0; i < len; ++i) {
@@ -387,13 +437,9 @@ VectorPtr LiquidByteViewArray::to_velox(
             rawValues[i] = StringView(rawStrings + string_offset, entry_len);
             string_offset += entry_len;
         } else {
-            // Null entry: StringView is default-constructed (empty, zeroed)
             rawValues[i] = StringView();
         }
     }
-
-    auto nulls = copy_null_bitmap_to_velox(dictionary_keys_, pool);
-    TypePtr veloxType = is_binary_ ? TypePtr(VARBINARY()) : TypePtr(VARCHAR());
 
     return std::make_shared<FlatVector<StringView>>(
         pool, veloxType, nulls,

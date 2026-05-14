@@ -155,10 +155,21 @@ LiquidArrayRef make_liquid_array(LiquidArrayT inner,
         std::move(inner), dt, pt, std::move(original_type));
 }
 
+// Forward declaration
+class LiquidCompressorStates;
+
 /// Transcode an Arrow array into an in-memory LiquidArrayRef.
 /// Defined in transcoder_arrow.cpp. Returns nullptr for unsupported types.
 /// This is the key entry point for the arrow → liquid → velox pipeline.
 LiquidArrayRef transcode_to_liquid_array(
     const std::shared_ptr<arrow::Array>& array);
+
+/// Transcode with optional compressor states for FSST cross-batch reuse.
+/// Pass nullptr to always train new compressors (backward compatible).
+/// When non-null, reuses trained FSST compressors across batches within
+/// the same column, mirroring Rust's LiquidCompressorStates pattern.
+LiquidArrayRef transcode_to_liquid_array(
+    const std::shared_ptr<arrow::Array>& array,
+    LiquidCompressorStates* states);
 
 }  // namespace liquid_cache

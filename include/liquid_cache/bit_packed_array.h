@@ -63,8 +63,9 @@ public:
     }
 
     /// Pack unsigned values with the given bit width.
-    /// This is a straightforward scalar implementation; a production version
-    /// would use FastLanes SIMD kernels (1024-element blocks).
+    /// Each element's bits are placed at sequential positions (bit_offset = i * bw).
+    /// The buffer is zero-initialised, so byte-level |= acts as pure writes
+    /// for non-overlapping bytes — read-modify-write would be slower here.
     void pack(const uint64_t* values, uint32_t count, uint8_t bw) {
         bit_width_ = bw;
         length_ = count;
@@ -84,13 +85,11 @@ public:
             uint8_t bit_idx = bit_offset % 8;
             size_t bytes_needed = (bit_idx + bw + 7) / 8;
 
-            // Write low part: val << bit_idx may overflow when bit_idx + bw > 64
             uint64_t shifted_low = val << bit_idx;
             for (size_t b = 0; b < std::min<size_t>(8, bytes_needed) && (byte_idx + b) < packed_data_.size(); ++b) {
                 packed_data_[byte_idx + b] |= static_cast<uint8_t>(shifted_low >> (b * 8));
             }
 
-            // Write high part if value spans more than 8 bytes
             if (bit_idx > 0 && bit_idx + bw > 64) {
                 uint64_t shifted_high = val >> (64 - bit_idx);
                 for (size_t b = 8; b < bytes_needed && (byte_idx + b) < packed_data_.size(); ++b) {
