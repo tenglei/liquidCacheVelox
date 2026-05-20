@@ -598,11 +598,13 @@ LiquidArrayRef transcode_to_liquid_array(
                 LiquidDataType::ByteViewArray, PhysicalType::UInt8, orig_type);
         }
 
-        // ── Dictionary types (String/Binary with UInt16 keys) ────────
-        case arrow::Type::DICTIONARY: {
-            auto dict_type = std::static_pointer_cast<arrow::DictionaryType>(orig_type);
-            auto value_type_id = dict_type->value_type()->id();
-            if (dict_type->index_type()->id() == arrow::Type::UINT16 &&
+        // ── Dictionary types (String/Binary with UInt16/UINT32/INT32 keys) ────────
+        case arrow::Type::DICTIONARY:
+            {
+                auto dict_type = std::static_pointer_cast<arrow::DictionaryType>(orig_type);
+                auto value_type_id = dict_type->value_type()->id();
+                auto index_type_id = dict_type->index_type()->id();
+                if ((index_type_id == arrow::Type::UINT16 || index_type_id == arrow::Type::UINT32 || index_type_id == arrow::Type::INT32) &&
                 (value_type_id == arrow::Type::STRING ||
                  value_type_id == arrow::Type::BINARY ||
                  value_type_id == arrow::Type::LARGE_STRING ||

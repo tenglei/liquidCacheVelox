@@ -402,7 +402,8 @@ public:
         Stats s;
         s.entry_count = entries_.size();
         for (const auto& [key, entry] : entries_) {
-            s.total_memory_bytes += entry.memory_size();
+            size_t entrySize = entry.memory_size();
+            s.total_memory_bytes += entrySize;
             if (entry.type == CacheEntryType::MemoryLiquid) ++s.liquid_entries;
             else ++s.arrow_entries;
         }

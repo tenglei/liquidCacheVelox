@@ -5,6 +5,7 @@
 
 #include <arrow/util/logging.h>  // MUST be first: defines ARROW_CHECK_OK macro
 #include <arrow/api.h>
+#include <arrow/util/bit_util.h>
 #include <arrow/compute/api.h>
 #include <arrow/type_traits.h>
 
@@ -52,6 +53,60 @@ inline uint8_t get_bit_width(uint64_t value) {
     // to return the minimum bit width needed, which is 1 even for 0.
     if (value == 0) return 1;
     return static_cast<uint8_t>(64 - __builtin_clzll(value));
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Custom min/max function - replaces arrow::compute::MinMax
+// ═══════════════════════════════════════════════════════════════════════
+template <typename ArrowType>
+struct MinMaxResult {
+    typename ArrowType::c_type min_value;
+    typename ArrowType::c_type max_value;
+};
+
+template <typename ArrowType>
+MinMaxResult<ArrowType> compute_min_max(const std::shared_ptr<arrow::Array>& array) {
+    using ArrayT = typename arrow::TypeTraits<ArrowType>::ArrayType;
+    using NativeT = typename ArrowType::c_type;
+
+    auto typed = std::static_pointer_cast<ArrayT>(array);
+    const int64_t len = typed->length();
+
+    // Handle all-null case
+    if (typed->null_count() == len) {
+        return MinMaxResult<ArrowType>{0, 0};
+    }
+
+    // Find first non-null value
+    int64_t i = 0;
+    const uint8_t* null_bitmap = typed->null_bitmap() ? typed->null_bitmap()->data() : nullptr;
+    int64_t offset = typed->offset();
+
+    if (null_bitmap) {
+        while (i < len && !arrow::bit_util::GetBit(null_bitmap, offset + i)) {
+            ++i;
+        }
+    }
+
+    if (i >= len) {
+        return MinMaxResult<ArrowType>{0, 0};
+    }
+
+    NativeT min_val = typed->Value(i);
+    NativeT max_val = typed->Value(i);
+    ++i;
+
+    // Iterate through remaining values
+    for (; i < len; ++i) {
+        if (null_bitmap && !arrow::bit_util::GetBit(null_bitmap, offset + i)) {
+            continue;
+        }
+        NativeT v = typed->Value(i);
+        if (v < min_val) min_val = v;
+        if (v > max_val) max_val = v;
+    }
+
+    return MinMaxResult<ArrowType>{min_val, max_val};
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -155,15 +210,10 @@ public:
             return result;
         }
 
-        // Compute min/max
-        auto min_max = arrow::compute::MinMax(array);
-        auto min_max_scalar = min_max.ValueOrDie().scalar_as<arrow::StructScalar>();
-        NativeT min_val = std::static_pointer_cast<
-            typename arrow::TypeTraits<ArrowType>::ScalarType>(
-                min_max_scalar.value[0])->value;
-        NativeT max_val = std::static_pointer_cast<
-            typename arrow::TypeTraits<ArrowType>::ScalarType>(
-                min_max_scalar.value[1])->value;
+        // Compute min/max using custom function
+        auto min_max = compute_min_max<ArrowType>(array);
+        NativeT min_val = min_max.min_value;
+        NativeT max_val = min_max.max_value;
 
         result.reference_value_ = min_val;
 
@@ -462,7 +512,8 @@ public:
                     __int128_t d = static_cast<__int128_t>(vu) - static_cast<__int128_t>(p);
                     int64_t r = (d > INT64_MAX) ? INT64_MAX
                               : (d < INT64_MIN) ? INT64_MIN : static_cast<int64_t>(d);
-                    if (r < rmin) rmin = r; if (r > rmax) rmax = r;
+                    if (r < rmin) { rmin = r; }
+                    if (r > rmax) { rmax = r; }
                     residuals.push_back(r);
                 } else { residuals.push_back(0); }
             }
@@ -480,7 +531,8 @@ public:
                     __int128_t d = static_cast<__int128_t>(vi) - static_cast<__int128_t>(p);
                     int64_t r = (d > INT64_MAX) ? INT64_MAX
                               : (d < INT64_MIN) ? INT64_MIN : static_cast<int64_t>(d);
-                    if (r < rmin) rmin = r; if (r > rmax) rmax = r;
+                    if (r < rmin) { rmin = r; }
+                    if (r > rmax) { rmax = r; }
                     residuals.push_back(r);
                 } else { residuals.push_back(0); }
             }
@@ -1291,22 +1343,32 @@ public:
     /// Predicate helpers: given [lo, hi] bucket range and literal k,
     /// return true/false if definite, nullopt if ambiguous.
     static std::optional<bool> handle_eq(FloatT lo, FloatT hi, FloatT k) {
-        if (k < lo || k > hi) return false; return std::nullopt;
+        if (k < lo || k > hi) { return false; }
+        return std::nullopt;
     }
     static std::optional<bool> handle_neq(FloatT lo, FloatT hi, FloatT k) {
-        if (k < lo || k > hi) return true; return std::nullopt;
+        if (k < lo || k > hi) { return true; }
+        return std::nullopt;
     }
     static std::optional<bool> handle_lt(FloatT lo, FloatT hi, FloatT k) {
-        if (k <= lo) return false; if (hi < k) return true; return std::nullopt;
+        if (k <= lo) { return false; }
+        if (hi < k) { return true; }
+        return std::nullopt;
     }
     static std::optional<bool> handle_lteq(FloatT lo, FloatT hi, FloatT k) {
-        if (k < lo) return false; if (hi <= k) return true; return std::nullopt;
+        if (k < lo) { return false; }
+        if (hi <= k) { return true; }
+        return std::nullopt;
     }
     static std::optional<bool> handle_gt(FloatT lo, FloatT hi, FloatT k) {
-        if (k < lo) return true; if (hi <= k) return false; return std::nullopt;
+        if (k < lo) { return true; }
+        if (hi <= k) { return false; }
+        return std::nullopt;
     }
     static std::optional<bool> handle_gteq(FloatT lo, FloatT hi, FloatT k) {
-        if (k <= lo) return true; if (hi < k) return false; return std::nullopt;
+        if (k <= lo) { return true; }
+        if (hi < k) { return false; }
+        return std::nullopt;
     }
 
     /// Try to evaluate a comparison predicate using only the quantized

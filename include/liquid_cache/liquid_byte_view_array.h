@@ -285,7 +285,7 @@ public:
         return result;
     }
 
-    /// Encode directly from an Arrow DictionaryArray with UInt16 keys.
+    /// Encode directly from an Arrow DictionaryArray with UInt16 or UInt32 keys.
     /// Reuses Arrow's existing dictionary values and keys unchanged,
     /// avoiding the round-trip through flat StringArray + hash map rebuild.
     /// This is the fast path for Parquet dictionary-encoded string columns.
@@ -342,14 +342,33 @@ public:
             dict_values[d].assign(reinterpret_cast<const char*>(data), vlen);
         }
 
-        // Step 2: Extract keys from Arrow indices (already uint16)
-        auto indices_array = std::static_pointer_cast<arrow::UInt16Array>(
-            dict_array->indices());
-        const uint16_t* raw_indices = indices_array->raw_values();
+        // Step 2: Extract keys from Arrow indices
+        auto index_type = dict_type->index_type()->id();
+        std::vector<uint32_t> keys(len);  // Use uint32_t to support larger dicts
 
-        std::vector<uint16_t> keys(len);
-        for (int64_t i = 0; i < len; ++i) {
-            keys[i] = dict_array->IsNull(i) ? 0 : raw_indices[i];
+        if (index_type == arrow::Type::UINT16) {
+            auto indices_array = std::static_pointer_cast<arrow::UInt16Array>(
+                dict_array->indices());
+            const uint16_t* raw_indices = indices_array->raw_values();
+            for (int64_t i = 0; i < len; ++i) {
+                keys[i] = dict_array->IsNull(i) ? 0 : raw_indices[i];
+            }
+        } else if (index_type == arrow::Type::UINT32) {
+            auto indices_array = std::static_pointer_cast<arrow::UInt32Array>(
+                dict_array->indices());
+            const uint32_t* raw_indices = indices_array->raw_values();
+            for (int64_t i = 0; i < len; ++i) {
+                keys[i] = dict_array->IsNull(i) ? 0 : raw_indices[i];
+            }
+        } else if (index_type == arrow::Type::INT32) {
+            auto indices_array = std::static_pointer_cast<arrow::Int32Array>(
+                dict_array->indices());
+            const int32_t* raw_indices = indices_array->raw_values();
+            for (int64_t i = 0; i < len; ++i) {
+                keys[i] = dict_array->IsNull(i) ? 0 : static_cast<uint32_t>(raw_indices[i]);
+            }
+        } else {
+            throw std::runtime_error("Unsupported dictionary index type");
         }
 
         // Step 3: Shared prefix → FSST → PrefixKeys → BitPackedArray
@@ -689,6 +708,29 @@ private:
             const uint8_t* null_bitmap_data,
             int64_t len,
             const FsstCompressor* compressor = nullptr) {
+        build_encoded_dict_impl(result, dict_values, keys, null_bitmap_data, len, compressor);
+    }
+
+    /// Overload for uint32_t keys (supports larger dictionaries).
+    static void build_encoded_dict(
+            LiquidByteViewArray& result,
+            const std::vector<std::string>& dict_values,
+            const uint32_t* keys,
+            const uint8_t* null_bitmap_data,
+            int64_t len,
+            const FsstCompressor* compressor = nullptr) {
+        build_encoded_dict_impl(result, dict_values, keys, null_bitmap_data, len, compressor);
+    }
+
+    /// Implementation template for both uint16_t and uint32_t keys.
+    template <typename KeyT>
+    static void build_encoded_dict_impl(
+            LiquidByteViewArray& result,
+            const std::vector<std::string>& dict_values,
+            const KeyT* keys,
+            const uint8_t* null_bitmap_data,
+            int64_t len,
+            const FsstCompressor* compressor) {
         // Step A: Compute shared prefix
         if (!dict_values.empty()) {
             result.shared_prefix_.assign(
@@ -754,8 +796,8 @@ private:
         }
 
         // Step F: BitPackedArray for keys
-        uint16_t max_key = dict_values.empty() ? 0 :
-            static_cast<uint16_t>(dict_values.size() - 1);
+        KeyT max_key = dict_values.empty() ? 0 :
+            static_cast<KeyT>(dict_values.size() - 1);
         uint8_t bw = get_bit_width(static_cast<uint64_t>(max_key));
         std::vector<uint64_t> key_offsets(len);
         for (int64_t i = 0; i < len; ++i) {
