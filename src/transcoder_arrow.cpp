@@ -645,6 +645,76 @@ LiquidArrayRef transcode_to_liquid_array(
                 LiquidDataType::FixedLenByteArray, PhysicalType::UInt16, orig_type);
         }
 
+        // ── Run-End Encoded ─────────────────────────────────────────
+        case arrow::Type::RUN_END_ENCODED: {
+            // Expand run-end encoded array to regular array, then transcode
+            auto ree_array = std::static_pointer_cast<arrow::RunEndEncodedArray>(array);
+            auto run_ends = ree_array->run_ends();
+            auto values = ree_array->values();
+            int64_t length = ree_array->length();
+
+            // Build a builder for the values type
+            auto value_type = values->type();
+            std::shared_ptr<arrow::Array> expanded;
+            if (value_type->id() == arrow::Type::INT32) {
+                // Expand int32 run-end encoded
+                arrow::Int32Builder builder(arrow::int32(), arrow::default_memory_pool());
+                auto run_ends_int32 = std::static_pointer_cast<arrow::Int32Array>(run_ends);
+                auto values_int32 = std::static_pointer_cast<arrow::Int32Array>(values);
+                int32_t prev_end = 0;
+                for (int64_t i = 0; i < run_ends_int32->length(); ++i) {
+                    int32_t run_end = run_ends_int32->Value(i);
+                    int32_t value = values_int32->Value(i);
+                    int32_t run_length = run_end - prev_end;
+                    auto status = builder.AppendValues(std::vector<int32_t>(run_length, value));
+                    if (!status.ok()) {
+                        ARROW_LOG(WARNING) << "LiquidCache: Failed to expand RUN_END_ENCODED int32: " << status.ToString();
+                        return nullptr;
+                    }
+                    prev_end = run_end;
+                }
+                auto finish_result = builder.Finish();
+                if (!finish_result.ok()) {
+                    ARROW_LOG(WARNING) << "LiquidCache: Failed to finish RUN_END_ENCODED int32 builder: " << finish_result.status().ToString();
+                    return nullptr;
+                }
+                expanded = finish_result.ValueOrDie();
+            } else if (value_type->id() == arrow::Type::INT64) {
+                // Expand int64 run-end encoded
+                arrow::Int64Builder builder(arrow::int64(), arrow::default_memory_pool());
+                auto run_ends_int64 = std::static_pointer_cast<arrow::Int64Array>(run_ends);
+                auto values_int64 = std::static_pointer_cast<arrow::Int64Array>(values);
+                int64_t prev_end = 0;
+                for (int64_t i = 0; i < run_ends_int64->length(); ++i) {
+                    int64_t run_end = run_ends_int64->Value(i);
+                    int64_t value = values_int64->Value(i);
+                    int64_t run_length = run_end - prev_end;
+                    auto status = builder.AppendValues(std::vector<int64_t>(run_length, value));
+                    if (!status.ok()) {
+                        ARROW_LOG(WARNING) << "LiquidCache: Failed to expand RUN_END_ENCODED int64: " << status.ToString();
+                        return nullptr;
+                    }
+                    prev_end = run_end;
+                }
+                auto finish_result = builder.Finish();
+                if (!finish_result.ok()) {
+                    ARROW_LOG(WARNING) << "LiquidCache: Failed to finish RUN_END_ENCODED int64 builder: " << finish_result.status().ToString();
+                    return nullptr;
+                }
+                expanded = finish_result.ValueOrDie();
+            } else {
+                // Log unsupported run-end encoded types for debugging
+                ARROW_LOG(WARNING) << "LiquidCache: Unsupported RUN_END_ENCODED value type: "
+                                   << value_type->ToString()
+                                   << " run_ends type: " << run_ends->type()->ToString()
+                                   << " length: " << length;
+                return nullptr;
+            }
+
+            // Transcode the expanded array
+            return transcode_to_liquid_array(expanded);
+        }
+
         default:
             return nullptr;
     }
