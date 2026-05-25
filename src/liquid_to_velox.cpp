@@ -396,6 +396,7 @@ VectorPtr LiquidByteViewArray::to_velox(
             pool, veloxType, nullptr,
             static_cast<vector_size_t>(dict_size), dictValuesBuf,
             std::vector<BufferPtr>{dictStringBuf});
+        dictVec->template as<SimpleVector<StringView>>()->setAllIsAscii(is_ascii_);
 
         // Convert uint16 keys to vector_size_t indices.
         auto indices = AlignedBuffer::allocate<vector_size_t>(
@@ -405,8 +406,10 @@ VectorPtr LiquidByteViewArray::to_velox(
             rawIndices[i] = static_cast<vector_size_t>(keys[i]);
         }
 
-        return std::make_shared<DictionaryVector<StringView>>(
+        auto result = std::make_shared<DictionaryVector<StringView>>(
             pool, nulls, static_cast<vector_size_t>(len), dictVec, indices);
+        result->template as<SimpleVector<StringView>>()->setAllIsAscii(is_ascii_);
+        return result;
     }
 
     // ── FlatVector path for high-cardinality dictionaries ─────────────
@@ -441,10 +444,12 @@ VectorPtr LiquidByteViewArray::to_velox(
         }
     }
 
-    return std::make_shared<FlatVector<StringView>>(
+    auto vec = std::make_shared<FlatVector<StringView>>(
         pool, veloxType, nulls,
         static_cast<vector_size_t>(len), valuesBuf,
         std::vector<BufferPtr>{stringBuffer});
+    vec->template as<SimpleVector<StringView>>()->setAllIsAscii(is_ascii_);
+    return vec;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
