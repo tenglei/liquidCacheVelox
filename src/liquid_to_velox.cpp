@@ -396,8 +396,6 @@ VectorPtr LiquidByteViewArray::to_velox(
             pool, veloxType, nullptr,
             static_cast<vector_size_t>(dict_size), dictValuesBuf,
             std::vector<BufferPtr>{dictStringBuf});
-        dictVec->template as<SimpleVector<StringView>>()->setAllIsAscii(is_ascii_);
-
         // Convert uint16 keys to vector_size_t indices.
         auto indices = AlignedBuffer::allocate<vector_size_t>(
             static_cast<vector_size_t>(len), pool);
@@ -408,7 +406,7 @@ VectorPtr LiquidByteViewArray::to_velox(
 
         auto result = std::make_shared<DictionaryVector<StringView>>(
             pool, nulls, static_cast<vector_size_t>(len), dictVec, indices);
-        result->template as<SimpleVector<StringView>>()->setAllIsAscii(is_ascii_);
+        result->setAllIsAscii(is_ascii_);
         return result;
     }
 
@@ -448,7 +446,7 @@ VectorPtr LiquidByteViewArray::to_velox(
         pool, veloxType, nulls,
         static_cast<vector_size_t>(len), valuesBuf,
         std::vector<BufferPtr>{stringBuffer});
-    vec->template as<SimpleVector<StringView>>()->setAllIsAscii(is_ascii_);
+    vec->setAllIsAscii(is_ascii_);
     return vec;
 }
 
