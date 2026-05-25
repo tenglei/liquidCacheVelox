@@ -172,8 +172,10 @@ struct ByteViewArrayHeader {
     uint32_t shared_prefix_size;
     uint32_t fsst_raw_size;
     uint32_t fingerprint_size;
+    uint8_t reserved[3] = {};
+    uint8_t flags = 0;  // bit 0 = is_ascii
 
-    static constexpr size_t SIZE = 20;
+    static constexpr size_t SIZE = 24;  // 5x u32 + 3 reserved + 1 flags
 
     void serialize(std::vector<uint8_t>& out) const {
         auto write_u32 = [&](uint32_t v) {
@@ -185,6 +187,8 @@ struct ByteViewArrayHeader {
         write_u32(shared_prefix_size);
         write_u32(fsst_raw_size);
         write_u32(fingerprint_size);
+        out.insert(out.end(), reserved, reserved + 3);
+        out.push_back(flags);
     }
 
     static ByteViewArrayHeader deserialize(const uint8_t* data) {
@@ -194,6 +198,8 @@ struct ByteViewArrayHeader {
         std::memcpy(&h.shared_prefix_size, data + 8, 4);
         std::memcpy(&h.fsst_raw_size, data + 12, 4);
         std::memcpy(&h.fingerprint_size, data + 16, 4);
+        std::memcpy(h.reserved, data + 20, 3);
+        h.flags = data[23];
         return h;
     }
 };
@@ -211,6 +217,9 @@ public:
         LiquidByteViewArray result;
         result.is_binary_ = (array->type_id() == arrow::Type::BINARY ||
                              array->type_id() == arrow::Type::LARGE_BINARY);
+        if (!result.is_binary_) {
+            result.is_ascii_ = check_all_ascii(array);
+        }
         const int64_t len = array->length();
 
         // Step 1: Build dictionary (deduplicate strings)
@@ -292,6 +301,9 @@ public:
 
         // Step 1: Extract dictionary values (already unique, no hash map needed)
         auto values_array = dict_array->dictionary();
+        if (!result.is_binary_) {
+            result.is_ascii_ = check_all_ascii(values_array);
+        }
         int64_t dict_size = values_array->length();
         std::vector<std::string> dict_values(dict_size);
 
@@ -354,6 +366,9 @@ public:
         LiquidByteViewArray result;
         result.is_binary_ = (array->type_id() == arrow::Type::BINARY ||
                              array->type_id() == arrow::Type::LARGE_BINARY);
+        if (!result.is_binary_) {
+            result.is_ascii_ = check_all_ascii(array);
+        }
         result.compressor_ = compressor;  // copy pre-trained compressor
         const int64_t len = array->length();
 
@@ -517,6 +532,7 @@ public:
         bvh.shared_prefix_size = static_cast<uint32_t>(shared_prefix_.size());
         bvh.fsst_raw_size = static_cast<uint32_t>(fsst_section.size());
         bvh.fingerprint_size = 0;
+        bvh.flags = is_ascii_ ? 1 : 0;
         bvh.serialize(out);
 
         // 3. Align to 8 bytes, then write sections
@@ -564,6 +580,7 @@ public:
             throw std::runtime_error("Buffer too small for ByteViewArrayHeader");
         }
         auto bvh = ByteViewArrayHeader::deserialize(data + pos);
+        result.is_ascii_ = (bvh.flags & 0x01) != 0;
         pos += ByteViewArrayHeader::SIZE;
         pos = align8(pos);
 
@@ -775,7 +792,37 @@ private:
     BitPackedArray dictionary_keys_;
     std::vector<PrefixKey> prefix_keys_;
     std::vector<uint8_t> shared_prefix_;
+    /// Returns true if every non-null string in the Arrow array is pure ASCII.
+    static bool check_all_ascii(const std::shared_ptr<arrow::Array>& array) {
+        if (array->type_id() == arrow::Type::BINARY ||
+            array->type_id() == arrow::Type::LARGE_BINARY) {
+            return false;
+        }
+        const uint8_t* null_bm = array->null_bitmap_data();
+        for (int64_t i = 0; i < array->length(); ++i) {
+            if (null_bm && ((null_bm[i >> 3] & (1 << (i & 7))) == 0)) continue;
+            int32_t vlen = 0;
+            const uint8_t* data = nullptr;
+            if (array->type_id() == arrow::Type::STRING) {
+                auto sa = std::static_pointer_cast<const arrow::StringArray>(array);
+                data = sa->GetValue(i, &vlen);
+            } else if (array->type_id() == arrow::Type::LARGE_STRING) {
+                auto sa = std::static_pointer_cast<const arrow::LargeStringArray>(array);
+                int64_t lvlen;
+                data = sa->GetValue(i, &lvlen);
+                vlen = static_cast<int32_t>(lvlen);
+            } else {
+                return false;  // Not a string type
+            }
+            for (int32_t j = 0; j < vlen; ++j) {
+                if (data[j] >= 0x80) return false;
+            }
+        }
+        return true;
+    }
+
     bool is_binary_ = false;  // true for Binary/LargeBinary, false for String/LargeString
+    bool is_ascii_ = false;   // true if all strings contain only ASCII bytes
 
     // ── Cached decompressed dictionary (lazy, avoids repeated FSST decompress) ──
     struct DecompressedDict {
