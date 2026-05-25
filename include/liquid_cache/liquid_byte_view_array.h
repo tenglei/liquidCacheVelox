@@ -164,7 +164,7 @@ private:
 };
 
 // ═══════════════════════════════════════════════════════════════════════
-// ByteViewArrayHeader: 20-byte header for serialized ByteViewArray
+// ByteViewArrayHeader: 24-byte header for serialized ByteViewArray
 // ═══════════════════════════════════════════════════════════════════════
 struct ByteViewArrayHeader {
     uint32_t keys_size;
