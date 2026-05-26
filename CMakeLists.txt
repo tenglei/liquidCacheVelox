@@ -218,6 +218,9 @@ if(LIQUID_ENABLE_VELOX AND VELOX_PREFIX)
             ${_VELOX_ARROW_INC}
             ${_VELOX_SRC_DIR}
             ${VELOX_PREFIX}
+            ${VELOX_PREFIX}/_deps/folly-src
+            ${VELOX_PREFIX}/_deps/folly-build
+            ${VELOX_PREFIX}/_deps/fmt-src/include
     )
     target_compile_definitions(liquid_cache_core
         PRIVATE LIQUID_ENABLE_VELOX NDEBUG

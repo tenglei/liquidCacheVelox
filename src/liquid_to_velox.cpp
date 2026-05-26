@@ -670,7 +670,7 @@ VectorPtr LiquidCacheStore::read_column_velox(
 // ═══════════════════════════════════════════════════════════════════════
 
 VectorPtr LiquidCacheStore::read_batch_velox(
-        uint16_t file_id,
+        uint64_t file_id,
         uint16_t rg_id,
         uint16_t batch_id,
         const RowTypePtr& rowType,

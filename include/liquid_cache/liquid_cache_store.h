@@ -31,6 +31,7 @@
 #include "liquid_cache/lru_policy.h"
 
 #ifdef LIQUID_ENABLE_VELOX
+#include "velox/common/caching/StringIdMap.h"
 namespace facebook::velox {
 class RowType;
 using RowTypePtr = std::shared_ptr<const RowType>;
@@ -42,44 +43,32 @@ namespace liquid_cache {
 // ═══════════════════════════════════════════════════════════════════════
 // LiquidCacheKey: identifies a specific column batch in the cache.
 // Equivalent to Rust's ParquetArrayID:
-//   file_id(16) | rg_id(16) | col_id(16) | batch_id(16)
+//   file_id(64) | rg_id(16) | col_id(16) | batch_id(16)
 // ═══════════════════════════════════════════════════════════════════════
 
 struct LiquidCacheKey {
-    uint16_t file_id = 0;
+    uint64_t file_id = 0;
     uint16_t rg_id = 0;      // row group id
     uint16_t col_id = 0;
     uint16_t batch_id = 0;
 
     LiquidCacheKey() = default;
-    LiquidCacheKey(uint16_t f, uint16_t rg, uint16_t c, uint16_t b)
+    LiquidCacheKey(uint64_t f, uint16_t rg, uint16_t c, uint16_t b)
         : file_id(f), rg_id(rg), col_id(c), batch_id(b) {}
 
-    /// Pack into a single uint64_t for hashing/comparison.
-    uint64_t to_u64() const {
-        return (static_cast<uint64_t>(file_id) << 48) |
-               (static_cast<uint64_t>(rg_id) << 32) |
-               (static_cast<uint64_t>(col_id) << 16) |
-               static_cast<uint64_t>(batch_id);
-    }
-
-    static LiquidCacheKey from_u64(uint64_t v) {
-        return {
-            static_cast<uint16_t>(v >> 48),
-            static_cast<uint16_t>((v >> 32) & 0xFFFF),
-            static_cast<uint16_t>((v >> 16) & 0xFFFF),
-            static_cast<uint16_t>(v & 0xFFFF)
-        };
-    }
-
     bool operator==(const LiquidCacheKey& o) const {
-        return to_u64() == o.to_u64();
+        return file_id == o.file_id && rg_id == o.rg_id &&
+               col_id == o.col_id && batch_id == o.batch_id;
     }
 };
 
 struct LiquidCacheKeyHash {
     size_t operator()(const LiquidCacheKey& k) const {
-        return std::hash<uint64_t>{}(k.to_u64());
+        size_t h = std::hash<uint64_t>{}(k.file_id);
+        h ^= std::hash<uint16_t>{}(k.rg_id) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<uint16_t>{}(k.col_id) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<uint16_t>{}(k.batch_id) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
     }
 };
 
@@ -91,7 +80,7 @@ namespace std {
 template <>
 struct hash<liquid_cache::LiquidCacheKey> {
     size_t operator()(const liquid_cache::LiquidCacheKey& k) const noexcept {
-        return hash<uint64_t>{}(k.to_u64());
+        return liquid_cache::LiquidCacheKeyHash{}(k);
     }
 };
 }  // namespace std
@@ -309,7 +298,7 @@ public:
     /// @param selection   Optional row filter mask (BooleanArray)
     /// @return RecordBatch with projected columns and filtered rows, or nullptr
     std::shared_ptr<arrow::RecordBatch> read_batch(
-            uint16_t file_id,
+            uint64_t file_id,
             uint16_t rg_id,
             uint16_t batch_id,
             const std::shared_ptr<arrow::Schema>& schema,
@@ -359,7 +348,7 @@ public:
 
     /// Metadata for a loaded row group: number of batches and rows.
     struct RowGroupInfo {
-        uint16_t file_id;
+        uint64_t file_id;
         uint16_t rg_id;
         uint16_t num_batches;
         size_t total_rows;
@@ -442,6 +431,9 @@ public:
         entries_.clear();
         budget_.reset();
         lru_.clear();
+#ifdef LIQUID_ENABLE_VELOX
+        file_leases_.clear();
+#endif
     }
 
     /// Number of entries tracked by the LRU policy.
@@ -475,7 +467,7 @@ public:
     /// @param projection  Column indices to read (empty = all columns)
     /// @return RowVector with projected columns, or nullptr
     facebook::velox::VectorPtr read_batch_velox(
-            uint16_t file_id,
+            uint64_t file_id,
             uint16_t rg_id,
             uint16_t batch_id,
             const facebook::velox::RowTypePtr& rowType,
@@ -537,6 +529,9 @@ private:
     size_t max_cache_bytes_ = 0;
     MemoryBudget budget_;
     mutable LruPolicy<LiquidCacheKey> lru_;
+#ifdef LIQUID_ENABLE_VELOX
+    std::vector<facebook::velox::StringIdLease> file_leases_;
+#endif
 };
 
 }  // namespace liquid_cache
