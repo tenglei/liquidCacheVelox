@@ -405,36 +405,28 @@ VectorPtr LiquidByteViewArray::to_velox(
     }
 
     // ── FlatVector path for high-cardinality dictionaries ─────────────
-    // Phase C: Pass 1 — compute total string bytes
-    int64_t total_string_bytes = 0;
-    for (uint32_t i = 0; i < len; ++i) {
-        if (!dictionary_keys_.is_null(i) && keys[i] < dict_size) {
-            total_string_bytes += dict_lens[keys[i]];
-        }
-    }
+    // Zero-copy: StringViews point directly into dict.flat_data.
+    // BufferView with DictReleaser keeps flat_data alive.
+    auto cached_dict = cached_dict_;  // shared_ptr copy extends lifetime
 
-    // Phase D: Allocate buffers
-    auto stringBuffer = AlignedBuffer::allocate<char>(
-        total_string_bytes, pool);
     auto valuesBuf = AlignedBuffer::allocate<StringView>(len, pool);
-    auto* rawStrings = stringBuffer->template asMutable<char>();
     auto* rawValues = valuesBuf->template asMutable<StringView>();
 
-    // Phase E: Pass 2 — copy strings and build StringView entries
-    int64_t string_offset = 0;
+    // Single pass: build StringViews, no memcpy
     for (uint32_t i = 0; i < len; ++i) {
         if (!dictionary_keys_.is_null(i) && keys[i] < dict_size) {
             uint16_t key = keys[i];
-            int32_t entry_len = dict_lens[key];
-            std::memcpy(rawStrings + string_offset,
-                        dict_flat + dict_flat_offsets[key],
-                        entry_len);
-            rawValues[i] = StringView(rawStrings + string_offset, entry_len);
-            string_offset += entry_len;
+            rawValues[i] = StringView(
+                reinterpret_cast<const char*>(dict_flat) + dict_flat_offsets[key],
+                dict_lens[key]);
         } else {
             rawValues[i] = StringView();
         }
     }
+
+    auto stringBuffer = BufferView<DecompressedDict::DictReleaser>::create(
+        dict_flat, dict.flat_data.size(),
+        DecompressedDict::DictReleaser{std::move(cached_dict)});
 
     auto vec = std::make_shared<FlatVector<StringView>>(
         pool, veloxType, nulls,
