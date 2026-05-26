@@ -678,22 +678,22 @@ VectorPtr LiquidCacheStore::read_batch_velox(
         const std::vector<int>& projection) const {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    // Determine which columns to read
-    std::vector<int> cols_to_read;
-    if (projection.empty()) {
-        cols_to_read.resize(rowType->size());
-        std::iota(cols_to_read.begin(), cols_to_read.end(), 0);
-    } else {
-        cols_to_read = projection;
-    }
+    // projection contains FILE COLUMN IDs (from table metadata)
+    // We iterate using OUTPUT INDICES (0, 1, 2...) to access rowType
+    size_t numOutputCols = rowType->size();
+    if (numOutputCols == 0) return nullptr;
 
     // Read each projected column as Velox Vector
     std::vector<VectorPtr> children;
-    children.reserve(cols_to_read.size());
+    children.reserve(numOutputCols);
 
-    for (int col_idx : cols_to_read) {
-        LiquidCacheKey key(file_id, rg_id,
-                           static_cast<uint16_t>(col_idx), batch_id);
+    for (size_t outIdx = 0; outIdx < numOutputCols; ++outIdx) {
+        // Get file column ID from projection vector, or use output index as fallback
+        uint16_t fileColId = (projection.size() > outIdx)
+            ? static_cast<uint16_t>(projection[outIdx])
+            : static_cast<uint16_t>(outIdx);
+
+        LiquidCacheKey key(file_id, rg_id, fileColId, batch_id);
         auto it = entries_.find(key);
         if (it == entries_.end()) return nullptr;
         const auto& entry = it->second;
@@ -708,12 +708,12 @@ VectorPtr LiquidCacheStore::read_batch_velox(
 
     if (children.empty()) return nullptr;
 
-    // Build projected RowType
+    // Build projected RowType using OUTPUT INDICES (not file column IDs)
     std::vector<std::string> names;
     std::vector<TypePtr> types;
-    names.reserve(cols_to_read.size());
-    types.reserve(cols_to_read.size());
-    for (int idx : cols_to_read) {
+    names.reserve(numOutputCols);
+    types.reserve(numOutputCols);
+    for (size_t idx = 0; idx < numOutputCols; ++idx) {
         names.push_back(rowType->nameOf(idx));
         types.push_back(rowType->childAt(idx));
     }
