@@ -370,26 +370,20 @@ VectorPtr LiquidByteViewArray::to_velox(
     // into a FlatVector.  This avoids O(N) memcpy per decode.
     if (dict_size > 0 && dict_size < len / 2) {
         // Build the base FlatVector<StringView> from dictionary entries.
-        // Compute total bytes for dictionary strings (not per-element).
-        int64_t dict_total_bytes = 0;
-        for (size_t d = 0; d < dict_size; ++d) {
-            dict_total_bytes += dict_lens[d];
-        }
+        // Zero-copy: wrap flat_data with BufferView, keep cached_dict_ alive
+        auto cached_dict = cached_dict_;  // shared_ptr copy extends lifetime
+        auto dictStringBuf = BufferView<DecompressedDict::DictReleaser>::create(
+            dict_flat, dict.flat_data.size(),
+            DecompressedDict::DictReleaser{std::move(cached_dict)});
 
-        auto dictStringBuf = AlignedBuffer::allocate<char>(
-            dict_total_bytes, pool);
         auto dictValuesBuf = AlignedBuffer::allocate<StringView>(
             static_cast<vector_size_t>(dict_size), pool);
-        auto* dictRawStrings = dictStringBuf->template asMutable<char>();
-        auto* dictRawViews  = dictValuesBuf->template asMutable<StringView>();
+        auto* dictRawViews = dictValuesBuf->template asMutable<StringView>();
 
-        int64_t dict_off = 0;
         for (size_t d = 0; d < dict_size; ++d) {
-            int32_t entry_len = dict_lens[d];
-            std::memcpy(dictRawStrings + dict_off,
-                        dict_flat + dict_flat_offsets[d], entry_len);
-            dictRawViews[d] = StringView(dictRawStrings + dict_off, entry_len);
-            dict_off += entry_len;
+            dictRawViews[d] = StringView(
+                reinterpret_cast<const char*>(dict_flat) + dict_flat_offsets[d],
+                dict_lens[d]);
         }
 
         auto dictVec = std::make_shared<FlatVector<StringView>>(
