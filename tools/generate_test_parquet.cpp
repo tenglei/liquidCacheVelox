@@ -37,14 +37,16 @@ int main(int argc, char* argv[]) {
     // 5M rows × ~20 cols × ~100B/row (compressed) ≈ 512MB Parquet
     int64_t total_rows = 5'000'000;
     int64_t batch_size = 100'000;
+    unsigned int seed = 42;
     std::string output_path =
         "/home/tenglei/code/liquid-cache-cpp/build/test_data_512mb.parquet";
 
     if (argc >= 2) output_path = argv[1];
     if (argc >= 3) total_rows = std::stoll(argv[2]);
+    if (argc >= 4) seed = static_cast<unsigned int>(std::stoul(argv[3]));
 
     // ── Random generators ────────────────────────────────────────────
-    std::mt19937 rng(42);
+    std::mt19937 rng(seed);
 
     const std::vector<std::string> categories = {
         "electronics", "clothing", "food", "books", "sports",
