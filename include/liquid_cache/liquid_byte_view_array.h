@@ -831,6 +831,15 @@ private:
         // Pre-built contiguous data buffer for fast memcpy
         std::vector<uint8_t> flat_data;       // all entries concatenated
         std::vector<int32_t> flat_offsets;    // offset[d] = start of entry d in flat_data
+
+        // Releaser for BufferView zero-copy wrapping of flat_data.
+        // Holds a shared_ptr to keep flat_data alive while any
+        // Velox vector references it via StringView pointers.
+        struct DictReleaser {
+            std::shared_ptr<DecompressedDict> dict;
+            void addRef() const {}
+            void release() const {}
+        };
     };
     mutable std::shared_ptr<DecompressedDict> cached_dict_;
 
