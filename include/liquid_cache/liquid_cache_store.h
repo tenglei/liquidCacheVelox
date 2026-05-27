@@ -31,7 +31,6 @@
 #include "liquid_cache/lru_policy.h"
 
 #ifdef LIQUID_ENABLE_VELOX
-#include "velox/common/caching/StringIdMap.h"
 namespace facebook::velox {
 class RowType;
 using RowTypePtr = std::shared_ptr<const RowType>;
@@ -431,9 +430,6 @@ public:
         entries_.clear();
         budget_.reset();
         lru_.clear();
-#ifdef LIQUID_ENABLE_VELOX
-        file_leases_.clear();
-#endif
     }
 
     /// Number of entries tracked by the LRU policy.
@@ -529,9 +525,6 @@ private:
     size_t max_cache_bytes_ = 0;
     MemoryBudget budget_;
     mutable LruPolicy<LiquidCacheKey> lru_;
-#ifdef LIQUID_ENABLE_VELOX
-    std::vector<facebook::velox::StringIdLease> file_leases_;
-#endif
 };
 
 }  // namespace liquid_cache

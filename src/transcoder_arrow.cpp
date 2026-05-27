@@ -26,10 +26,6 @@
 #include "liquid_cache/liquid_cache_store.h"
 #include "liquid_cache/compressor_states.h"
 
-#ifdef LIQUID_ENABLE_VELOX
-#include "velox/common/caching/FileIds.h"
-#endif
-
 namespace liquid_cache {
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -778,22 +774,21 @@ std::vector<LiquidCacheStore::RowGroupInfo> LiquidCacheStore::load_from_parquet(
     std::vector<RowGroupInfo> rg_infos;
     auto t0 = std::chrono::steady_clock::now();
 
-    uint64_t file_id_counter = 0;
     for (const auto& path : files) {
         auto maybe_infile = arrow::io::ReadableFile::Open(path);
-        if (!maybe_infile.ok()) { ++file_id_counter; continue; }
+        if (!maybe_infile.ok()) { continue; }
         auto infile = maybe_infile.ValueOrDie();
 
         std::unique_ptr<parquet::arrow::FileReader> reader;
 #if ARROW_VERSION_MAJOR >= 19
         auto open_result = parquet::arrow::OpenFile(
             infile, arrow::default_memory_pool());
-        if (!open_result.ok()) { ++file_id_counter; continue; }
+        if (!open_result.ok()) { continue; }
         reader = std::move(open_result).ValueOrDie();
 #else
         auto open_status = parquet::arrow::OpenFile(
             infile, arrow::default_memory_pool(), &reader);
-        if (!open_status.ok()) { ++file_id_counter; continue; }
+        if (!open_status.ok()) { continue; }
 #endif
         reader->set_batch_size(8192);
 
@@ -808,20 +803,14 @@ std::vector<LiquidCacheStore::RowGroupInfo> LiquidCacheStore::load_from_parquet(
         std::shared_ptr<arrow::RecordBatchReader> batch_reader;
 #if ARROW_VERSION_MAJOR >= 19
         auto rb_result = reader->GetRecordBatchReader();
-        if (!rb_result.ok()) { ++file_id_counter; continue; }
+        if (!rb_result.ok()) { continue; }
         batch_reader = std::move(rb_result).ValueOrDie();
 #else
         auto rb_status = reader->GetRecordBatchReader(&batch_reader);
-        if (!rb_status.ok()) { ++file_id_counter; continue; }
+        if (!rb_status.ok()) { continue; }
 #endif
 
-#ifdef LIQUID_ENABLE_VELOX
-        auto& idMap = facebook::velox::fileIds();
-        uint64_t file_id = idMap.makeId(path);
-        file_leases_.emplace_back(idMap, file_id);
-#else
-        uint64_t file_id = file_id_counter;
-#endif
+        uint64_t file_id = std::hash<std::string>{}(path);
 
         uint16_t rg_id = 0;
         uint16_t batch_id = 0;
@@ -850,7 +839,6 @@ std::vector<LiquidCacheStore::RowGroupInfo> LiquidCacheStore::load_from_parquet(
         }
 
         rg_infos.push_back({file_id, rg_id, batch_id, rg_rows});
-        ++file_id_counter;
     }
 
     auto t1 = std::chrono::steady_clock::now();
@@ -872,22 +860,21 @@ std::vector<LiquidCacheStore::RowGroupInfo> LiquidCacheStore::load_from_parquet(
     // Per-column compressor states — trained lazily on first batch
     std::vector<std::unique_ptr<LiquidCompressorStates>> compressor_states;
 
-    uint64_t file_id_counter = 0;
     for (const auto& path : files) {
         auto maybe_infile = arrow::io::ReadableFile::Open(path);
-        if (!maybe_infile.ok()) { ++file_id_counter; continue; }
+        if (!maybe_infile.ok()) { continue; }
         auto infile = maybe_infile.ValueOrDie();
 
         std::unique_ptr<parquet::arrow::FileReader> reader;
 #if ARROW_VERSION_MAJOR >= 19
         auto open_result = parquet::arrow::OpenFile(
             infile, arrow::default_memory_pool());
-        if (!open_result.ok()) { ++file_id_counter; continue; }
+        if (!open_result.ok()) { continue; }
         reader = std::move(open_result).ValueOrDie();
 #else
         auto open_status = parquet::arrow::OpenFile(
             infile, arrow::default_memory_pool(), &reader);
-        if (!open_status.ok()) { ++file_id_counter; continue; }
+        if (!open_status.ok()) { continue; }
 #endif
         reader->set_batch_size(8192);
 
@@ -907,20 +894,14 @@ std::vector<LiquidCacheStore::RowGroupInfo> LiquidCacheStore::load_from_parquet(
         std::shared_ptr<arrow::RecordBatchReader> batch_reader;
 #if ARROW_VERSION_MAJOR >= 19
         auto rb_result = reader->GetRecordBatchReader();
-        if (!rb_result.ok()) { ++file_id_counter; continue; }
+        if (!rb_result.ok()) { continue; }
         batch_reader = std::move(rb_result).ValueOrDie();
 #else
         auto rb_status = reader->GetRecordBatchReader(&batch_reader);
-        if (!rb_status.ok()) { ++file_id_counter; continue; }
+        if (!rb_status.ok()) { continue; }
 #endif
 
-#ifdef LIQUID_ENABLE_VELOX
-        auto& idMap = facebook::velox::fileIds();
-        uint64_t file_id = idMap.makeId(path);
-        file_leases_.emplace_back(idMap, file_id);
-#else
-        uint64_t file_id = file_id_counter;
-#endif
+        uint64_t file_id = std::hash<std::string>{}(path);
 
         uint16_t rg_id = 0;
         uint16_t batch_id = 0;
@@ -956,7 +937,6 @@ std::vector<LiquidCacheStore::RowGroupInfo> LiquidCacheStore::load_from_parquet(
         }
 
         rg_infos.push_back({file_id, rg_id, batch_id, rg_rows});
-        ++file_id_counter;
     }
 
     auto t1 = std::chrono::steady_clock::now();
