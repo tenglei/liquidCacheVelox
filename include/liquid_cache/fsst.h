@@ -35,25 +35,29 @@ public:
 
     /// Train the symbol table from input data.
     /// Uses a greedy bigram/trigram counting approach (simplified vs. full FSST paper).
-    /// For large inputs, only samples the first 1MB for speed.
+    /// Optimized: smaller sample size, pre-allocated hash maps, nth_element sort.
     void train(const uint8_t* data, size_t len) {
         symbol_count_ = 0;
         if (len == 0) return;
 
-        // Sample data for large inputs to avoid O(n) hash map overhead
-        static constexpr size_t kMaxTrainBytes = 1 << 20;  // 1MB sample
+        // Optimized: reduce sample size to 64KB for faster training
+        static constexpr size_t kMaxTrainBytes = 1 << 16;  // 64KB sample (was 1MB)
         size_t train_len = std::min(len, kMaxTrainBytes);
 
-        // Count bigrams (2-byte sequences) - main compression opportunity
+        // Optimized: pre-allocate hash maps to reduce rehashing overhead
         std::unordered_map<uint16_t, uint32_t> bigram_counts;
+        bigram_counts.reserve(train_len / 2);  // Estimate unique bigrams
+        
+        // Count bigrams (2-byte sequences) - main compression opportunity
         for (size_t i = 0; i + 1 < train_len; ++i) {
             uint16_t bg = static_cast<uint16_t>(data[i]) |
                           (static_cast<uint16_t>(data[i + 1]) << 8);
             bigram_counts[bg]++;
         }
 
-        // Also count trigrams for better compression
+        // Optimized: pre-allocate for trigrams
         std::unordered_map<uint32_t, uint32_t> trigram_counts;
+        trigram_counts.reserve(train_len / 3);  // Estimate unique trigrams
         for (size_t i = 0; i + 2 < train_len; ++i) {
             uint32_t tg = static_cast<uint32_t>(data[i]) |
                           (static_cast<uint32_t>(data[i + 1]) << 8) |
@@ -69,6 +73,7 @@ public:
         };
         std::vector<Candidate> candidates;
 
+        // Collect candidates from bigrams
         for (auto& [bg, cnt] : bigram_counts) {
             if (cnt >= 4) {  // threshold
                 Candidate c;
@@ -81,6 +86,7 @@ public:
             }
         }
 
+        // Collect candidates from trigrams
         for (auto& [tg, cnt] : trigram_counts) {
             if (cnt >= 3) {
                 Candidate c;
@@ -94,11 +100,21 @@ public:
             }
         }
 
-        // Sort by savings (descending)
-        std::sort(candidates.begin(), candidates.end(),
-                  [](const Candidate& a, const Candidate& b) {
-                      return a.savings > b.savings;
-                  });
+        // Optimized: use nth_element instead of full sort (O(n) vs O(n log n))
+        // Only need top 255 symbols, not full ordering
+        if (candidates.size() > 255) {
+            std::nth_element(candidates.begin(), candidates.begin() + 255,
+                           candidates.end(),
+                           [](const Candidate& a, const Candidate& b) {
+                               return a.savings > b.savings;
+                           });
+            candidates.resize(255);
+        } else {
+            std::sort(candidates.begin(), candidates.end(),
+                     [](const Candidate& a, const Candidate& b) {
+                         return a.savings > b.savings;
+                     });
+        }
 
         // Select top symbols (up to 255)
         for (auto& c : candidates) {
@@ -113,29 +129,60 @@ public:
     }
 
     /// Compress input data using the trained symbol table.
-    /// Uses a first-byte lookup table for O(1) symbol narrowing per position.
+    /// Optimized: prioritize longer symbols (3-byte) before shorter (2-byte),
+    /// early exit on match to reduce memcmp calls.
     std::vector<uint8_t> compress(const uint8_t* input, size_t input_len) const {
         std::vector<uint8_t> output;
         output.reserve(input_len);
 
         size_t i = 0;
         while (i < input_len) {
-            // Use first-byte lookup table to narrow candidates
-            int best_sym = -1;
-            uint8_t best_len = 0;
             uint8_t first_byte = input[i];
-
-            // Check all symbols that start with this byte
             uint8_t start = first_byte_idx_[first_byte];
             uint8_t end = (first_byte < 255) ? first_byte_idx_[first_byte + 1]
                                              : symbol_count_;
-            for (uint8_t idx = start; idx < end; ++idx) {
-                uint8_t s = first_byte_syms_[idx];
-                uint8_t slen = symbols_[s].len;
-                if (slen > best_len && i + slen <= input_len) {
-                    if (std::memcmp(input + i, symbols_[s].bytes, slen) == 0) {
-                        best_sym = s;
-                        best_len = slen;
+
+            // Optimized: prioritize 3-byte symbols for better compression ratio
+            // Early exit when longest match found
+            int best_sym = -1;
+            uint8_t best_len = 0;
+
+            // Pass 1: Check 3-byte symbols first (longer = better compression)
+            if (i + 3 <= input_len) {
+                for (uint8_t idx = start; idx < end; ++idx) {
+                    uint8_t s = first_byte_syms_[idx];
+                    if (symbols_[s].len == 3) {
+                        // Optimized: compare 3 bytes in single operation
+                        uint32_t input_val = static_cast<uint32_t>(input[i]) |
+                                           (static_cast<uint32_t>(input[i + 1]) << 8) |
+                                           (static_cast<uint32_t>(input[i + 2]) << 16);
+                        uint32_t sym_val = static_cast<uint32_t>(symbols_[s].bytes[0]) |
+                                          (static_cast<uint32_t>(symbols_[s].bytes[1]) << 8) |
+                                          (static_cast<uint32_t>(symbols_[s].bytes[2]) << 16);
+                        if (input_val == sym_val) {
+                            best_sym = s;
+                            best_len = 3;
+                            break;  // Found longest match, early exit
+                        }
+                    }
+                }
+            }
+
+            // Pass 2: If no 3-byte match, check 2-byte symbols
+            if (best_len == 0 && i + 2 <= input_len) {
+                for (uint8_t idx = start; idx < end; ++idx) {
+                    uint8_t s = first_byte_syms_[idx];
+                    if (symbols_[s].len == 2) {
+                        // Optimized: compare 2 bytes in single operation
+                        uint16_t input_val = static_cast<uint16_t>(input[i]) |
+                                           (static_cast<uint16_t>(input[i + 1]) << 8);
+                        uint16_t sym_val = static_cast<uint16_t>(symbols_[s].bytes[0]) |
+                                          (static_cast<uint16_t>(symbols_[s].bytes[1]) << 8);
+                        if (input_val == sym_val) {
+                            best_sym = s;
+                            best_len = 2;
+                            break;  // Found match, early exit
+                        }
                     }
                 }
             }

@@ -5,6 +5,11 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# Optimized: add general performance flags for FSST and BitPacking
+if(NOT CMAKE_BUILD_TYPE OR CMAKE_BUILD_TYPE STREQUAL "Release")
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -march=native -ffast-math")
+endif()
+
 # ══════════════════════════════════════════════════════════════════
 # Velox Integration (optional, must be checked BEFORE finding deps)
 # ══════════════════════════════════════════════════════════════════
