@@ -892,14 +892,15 @@ std::vector<LiquidCacheStore::RowGroupInfo> LiquidCacheStore::load_from_parquet(
         {
             auto* pq_reader = reader->parquet_reader();
             auto meta = pq_reader->metadata();
+            uint64_t cum = 0;
             for (int i = 0; i < num_row_groups; ++i) {
                 auto rg_meta = meta->RowGroup(i);
                 auto off = static_cast<uint64_t>(rg_meta->file_offset());
                 if (off == 0 && rg_meta->num_columns() > 0)
                     off = static_cast<uint64_t>(rg_meta->ColumnChunk(0)->file_offset());
                 fmeta.rg_offsets.push_back(off);
-                fmeta.rg_row_counts.push_back(
-                    static_cast<uint64_t>(rg_meta->num_rows()));
+                cum += static_cast<uint64_t>(rg_meta->num_rows());
+                fmeta.rg_row_counts.push_back(cum);
             }
         }
 
@@ -1013,14 +1014,15 @@ std::vector<LiquidCacheStore::RowGroupInfo> LiquidCacheStore::load_from_parquet(
         {
             auto* pq_reader = reader->parquet_reader();
             auto meta = pq_reader->metadata();
+            uint64_t cum = 0;
             for (int i = 0; i < num_row_groups; ++i) {
                 auto rg_meta = meta->RowGroup(i);
                 auto off = static_cast<uint64_t>(rg_meta->file_offset());
                 if (off == 0 && rg_meta->num_columns() > 0)
                     off = static_cast<uint64_t>(rg_meta->ColumnChunk(0)->file_offset());
                 fmeta.rg_offsets.push_back(off);
-                fmeta.rg_row_counts.push_back(
-                    static_cast<uint64_t>(rg_meta->num_rows()));
+                cum += static_cast<uint64_t>(rg_meta->num_rows());
+                fmeta.rg_row_counts.push_back(cum);
             }
         }
 
