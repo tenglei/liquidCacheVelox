@@ -71,6 +71,16 @@ struct LiquidCacheKeyHash {
     }
 };
 
+// ═══════════════════════════════════════════════════════════════════════
+// FileRgMetadata: per-file row group byte offsets for split→RG mapping.
+// Populated during load_from_parquet, used by read_split_velox.
+// ═══════════════════════════════════════════════════════════════════════
+
+struct FileRgMetadata {
+    std::vector<uint64_t> rg_offsets;     // file_offset of each row group
+    std::vector<uint64_t> rg_row_counts;  // cumulative row count per row group
+};
+
 }  // namespace liquid_cache
 
 // std::hash specialization for LiquidCacheKey — needed by LruPolicy
@@ -431,6 +441,7 @@ public:
         entries_.clear();
         budget_.reset();
         lru_.clear();
+        file_metadata_.clear();
     }
 
     /// Number of entries tracked by the LRU policy.
@@ -467,6 +478,19 @@ public:
             uint64_t file_id,
             uint16_t rg_id,
             uint16_t batch_id,
+            const facebook::velox::RowTypePtr& rowType,
+            facebook::velox::memory::MemoryPool* pool,
+            const std::vector<int>& projection = {}) const;
+
+    /// Read all row groups covered by a byte-range split (Velox).
+    /// Maps (offset, length) → row group indices via file_metadata_ using
+    /// Velox ParquetReader::filterRowGroups() semantics. Iterates all batches
+    /// within each covered row group.
+    /// Returns nullptr if any batch of any column is missing.
+    facebook::velox::VectorPtr read_split_velox(
+            uint64_t file_id,
+            uint64_t offset,
+            uint64_t length,
             const facebook::velox::RowTypePtr& rowType,
             facebook::velox::memory::MemoryPool* pool,
             const std::vector<int>& projection = {}) const;
@@ -521,8 +545,27 @@ private:
         return budget_.usage() + needed_bytes <= max_cache_bytes_;
     }
 
+    /// Map (offset, length) → row group indices via cached footer metadata.
+    /// Uses Velox ParquetReader::filterRowGroups() semantics:
+    ///   rowGroupInRange = (fileOffset >= offset && fileOffset < limit)
+    std::vector<uint16_t> getRowGroupsForRange(
+            uint64_t file_id, uint64_t offset, uint64_t length) const {
+        auto it = file_metadata_.find(file_id);
+        if (it == file_metadata_.end()) return {};
+        uint64_t limit = offset + length;
+        std::vector<uint16_t> rgs;
+        for (size_t i = 0; i < it->second.rg_offsets.size(); ++i) {
+            if (it->second.rg_offsets[i] >= offset &&
+                it->second.rg_offsets[i] < limit) {
+                rgs.push_back(static_cast<uint16_t>(i));
+            }
+        }
+        return rgs;
+    }
+
     mutable std::mutex mutex_;
     std::unordered_map<LiquidCacheKey, CacheEntry, LiquidCacheKeyHash> entries_;
+    std::unordered_map<uint64_t, FileRgMetadata> file_metadata_;
     size_t max_cache_bytes_ = 0;
     MemoryBudget budget_;
     mutable LruPolicy<LiquidCacheKey> lru_;

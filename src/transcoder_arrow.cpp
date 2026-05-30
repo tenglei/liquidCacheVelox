@@ -883,17 +883,47 @@ std::vector<LiquidCacheStore::RowGroupInfo> LiquidCacheStore::load_from_parquet(
 #endif
 
         uint64_t file_id = std::hash<std::string>{}(path);
+        int num_row_groups = reader->num_row_groups();
+
+        // Collect metadata + row group boundary info
+        FileRgMetadata fmeta;
+        fmeta.rg_offsets.reserve(num_row_groups);
+        fmeta.rg_row_counts.reserve(num_row_groups);
+        {
+            auto* pq_reader = reader->parquet_reader();
+            auto meta = pq_reader->metadata();
+            for (int i = 0; i < num_row_groups; ++i) {
+                auto rg_meta = meta->RowGroup(i);
+                auto off = static_cast<uint64_t>(rg_meta->file_offset());
+                if (off == 0 && rg_meta->num_columns() > 0)
+                    off = static_cast<uint64_t>(rg_meta->ColumnChunk(0)->file_offset());
+                fmeta.rg_offsets.push_back(off);
+                fmeta.rg_row_counts.push_back(
+                    static_cast<uint64_t>(rg_meta->num_rows()));
+            }
+        }
 
         uint16_t rg_id = 0;
         uint16_t batch_id = 0;
         size_t rg_rows = 0;
+        uint64_t cum_rows = 0;
 
         while (true) {
             std::shared_ptr<arrow::RecordBatch> batch;
             auto st = batch_reader->ReadNext(&batch);
             if (!st.ok() || !batch) break;
 
+            // Detect row group boundary from metadata
+            while (rg_id < static_cast<uint16_t>(num_row_groups - 1) &&
+                   cum_rows >= fmeta.rg_row_counts[rg_id]) {
+                rg_infos.push_back({file_id, rg_id, batch_id, rg_rows});
+                rg_id++;
+                batch_id = 0;
+                rg_rows = 0;
+            }
+
             rg_rows += batch->num_rows();
+            cum_rows += batch->num_rows();
 
             for (int c = 0; c < batch->num_columns(); ++c) {
                 LiquidCacheKey key(file_id, rg_id,
@@ -903,7 +933,6 @@ std::vector<LiquidCacheStore::RowGroupInfo> LiquidCacheStore::load_from_parquet(
                 if (liquid) {
                     entries_[key] = CacheEntry::from_liquid(std::move(liquid));
                 } else {
-                    // Unsupported type: fall back to storing raw Arrow array
                     entries_[key] = CacheEntry::from_arrow(batch->column(c));
                 }
             }
@@ -911,6 +940,7 @@ std::vector<LiquidCacheStore::RowGroupInfo> LiquidCacheStore::load_from_parquet(
         }
 
         rg_infos.push_back({file_id, rg_id, batch_id, rg_rows});
+        file_metadata_[file_id] = std::move(fmeta);
     }
 
     auto t1 = std::chrono::steady_clock::now();
@@ -974,17 +1004,47 @@ std::vector<LiquidCacheStore::RowGroupInfo> LiquidCacheStore::load_from_parquet(
 #endif
 
         uint64_t file_id = std::hash<std::string>{}(path);
+        int num_row_groups = reader->num_row_groups();
+
+        // Collect metadata + row group boundary info
+        FileRgMetadata fmeta;
+        fmeta.rg_offsets.reserve(num_row_groups);
+        fmeta.rg_row_counts.reserve(num_row_groups);
+        {
+            auto* pq_reader = reader->parquet_reader();
+            auto meta = pq_reader->metadata();
+            for (int i = 0; i < num_row_groups; ++i) {
+                auto rg_meta = meta->RowGroup(i);
+                auto off = static_cast<uint64_t>(rg_meta->file_offset());
+                if (off == 0 && rg_meta->num_columns() > 0)
+                    off = static_cast<uint64_t>(rg_meta->ColumnChunk(0)->file_offset());
+                fmeta.rg_offsets.push_back(off);
+                fmeta.rg_row_counts.push_back(
+                    static_cast<uint64_t>(rg_meta->num_rows()));
+            }
+        }
 
         uint16_t rg_id = 0;
         uint16_t batch_id = 0;
         size_t rg_rows = 0;
+        uint64_t cum_rows = 0;
 
         while (true) {
             std::shared_ptr<arrow::RecordBatch> batch;
             auto st = batch_reader->ReadNext(&batch);
             if (!st.ok() || !batch) break;
 
+            // Detect row group boundary from metadata
+            while (rg_id < static_cast<uint16_t>(num_row_groups - 1) &&
+                   cum_rows >= fmeta.rg_row_counts[rg_id]) {
+                rg_infos.push_back({file_id, rg_id, batch_id, rg_rows});
+                rg_id++;
+                batch_id = 0;
+                rg_rows = 0;
+            }
+
             rg_rows += batch->num_rows();
+            cum_rows += batch->num_rows();
 
             for (int c = 0; c < batch->num_columns(); ++c) {
                 LiquidCacheKey key(file_id, rg_id,
@@ -1009,6 +1069,7 @@ std::vector<LiquidCacheStore::RowGroupInfo> LiquidCacheStore::load_from_parquet(
         }
 
         rg_infos.push_back({file_id, rg_id, batch_id, rg_rows});
+        file_metadata_[file_id] = std::move(fmeta);
     }
 
     auto t1 = std::chrono::steady_clock::now();

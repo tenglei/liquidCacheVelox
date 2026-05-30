@@ -678,21 +678,24 @@ VectorPtr LiquidCacheStore::read_batch_velox(
         const std::vector<int>& projection) const {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    // projection contains FILE COLUMN IDs (from table metadata)
-    // We iterate using OUTPUT INDICES (0, 1, 2...) to access rowType
-    size_t numOutputCols = rowType->size();
-    if (numOutputCols == 0) return nullptr;
+    // Determine which columns to read
+    std::vector<uint16_t> cols_to_read;
+    if (projection.empty()) {
+        cols_to_read.resize(rowType->size());
+        for (size_t i = 0; i < cols_to_read.size(); ++i)
+            cols_to_read[i] = static_cast<uint16_t>(i);
+    } else {
+        cols_to_read.reserve(projection.size());
+        for (int p : projection)
+            cols_to_read.push_back(static_cast<uint16_t>(p));
+    }
+    if (cols_to_read.empty()) return nullptr;
 
     // Read each projected column as Velox Vector
     std::vector<VectorPtr> children;
-    children.reserve(numOutputCols);
+    children.reserve(cols_to_read.size());
 
-    for (size_t outIdx = 0; outIdx < numOutputCols; ++outIdx) {
-        // Get file column ID from projection vector, or use output index as fallback
-        uint16_t fileColId = (projection.size() > outIdx)
-            ? static_cast<uint16_t>(projection[outIdx])
-            : static_cast<uint16_t>(outIdx);
-
+    for (uint16_t fileColId : cols_to_read) {
         LiquidCacheKey key(file_id, rg_id, fileColId, batch_id);
         auto it = entries_.find(key);
         if (it == entries_.end()) return nullptr;
@@ -708,14 +711,14 @@ VectorPtr LiquidCacheStore::read_batch_velox(
 
     if (children.empty()) return nullptr;
 
-    // Build projected RowType using OUTPUT INDICES (not file column IDs)
+    // Build projected RowType
     std::vector<std::string> names;
     std::vector<TypePtr> types;
-    names.reserve(numOutputCols);
-    types.reserve(numOutputCols);
-    for (size_t idx = 0; idx < numOutputCols; ++idx) {
-        names.push_back(rowType->nameOf(idx));
-        types.push_back(rowType->childAt(idx));
+    names.reserve(cols_to_read.size());
+    types.reserve(cols_to_read.size());
+    for (uint16_t fileColId : cols_to_read) {
+        names.push_back(rowType->nameOf(fileColId));
+        types.push_back(rowType->childAt(fileColId));
     }
     auto projRowType = ROW(std::move(names), std::move(types));
 
@@ -786,6 +789,86 @@ VectorPtr LiquidPrimitiveDeltaArray<ArrowType>::to_velox(
 // Explicit instantiations
 template VectorPtr LiquidPrimitiveDeltaArray<arrow::Int32Type>::to_velox(memory::MemoryPool*) const;
 template VectorPtr LiquidPrimitiveDeltaArray<arrow::Int64Type>::to_velox(memory::MemoryPool*) const;
+
+// ═══════════════════════════════════════════════════════════════════════
+// LiquidCacheStore::read_split_velox()
+// ═══════════════════════════════════════════════════════════════════════
+
+VectorPtr LiquidCacheStore::read_split_velox(
+        uint64_t file_id,
+        uint64_t offset,
+        uint64_t length,
+        const RowTypePtr& rowType,
+        memory::MemoryPool* pool,
+        const std::vector<int>& projection) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    auto rg_ids = getRowGroupsForRange(file_id, offset, length);
+    if (rg_ids.empty()) return nullptr;
+
+    // Determine which columns to read
+    std::vector<uint16_t> cols_to_read;
+    if (projection.empty()) {
+        cols_to_read.resize(rowType->size());
+        for (size_t i = 0; i < cols_to_read.size(); ++i)
+            cols_to_read[i] = static_cast<uint16_t>(i);
+    } else {
+        cols_to_read.reserve(projection.size());
+        for (int p : projection)
+            cols_to_read.push_back(static_cast<uint16_t>(p));
+    }
+    if (cols_to_read.empty()) return nullptr;
+
+    // Result vectors: one merged vector per output column
+    std::vector<VectorPtr> children(cols_to_read.size());
+
+    for (size_t outIdx = 0; outIdx < cols_to_read.size(); ++outIdx) {
+        uint16_t fileColId = cols_to_read[outIdx];
+
+        // Collect all batches for this column across all covered row groups
+        std::vector<VectorPtr> pieces;
+        for (auto rg_idx : rg_ids) {
+            uint16_t b = 0;
+            while (true) {
+                LiquidCacheKey key(file_id, rg_idx, fileColId, b);
+                auto it = entries_.find(key);
+                if (it == entries_.end()) break;
+                pieces.push_back(it->second.liquid_array->to_velox(pool));
+                ++b;
+            }
+        }
+        if (pieces.empty()) return nullptr;
+
+        if (pieces.size() == 1) {
+            children[outIdx] = std::move(pieces[0]);
+        } else {
+            auto merged = facebook::velox::BaseVector::create(
+                pieces[0]->type(), 0, pool);
+            vector_size_t total = 0;
+            for (auto& p : pieces) total += p->size();
+            merged->resize(total);
+            vector_size_t off = 0;
+            for (auto& p : pieces) {
+                merged->copy(p.get(), off, 0, p->size());
+                off += p->size();
+            }
+            children[outIdx] = std::move(merged);
+        }
+    }
+
+    std::vector<std::string> names;
+    std::vector<TypePtr> types;
+    names.reserve(cols_to_read.size());
+    types.reserve(cols_to_read.size());
+    for (uint16_t fileColId : cols_to_read) {
+        names.push_back(rowType->nameOf(fileColId));
+        types.push_back(rowType->childAt(fileColId));
+    }
+    auto projRowType = ROW(std::move(names), std::move(types));
+
+    return std::make_shared<RowVector>(
+        pool, projRowType, nullptr, children[0]->size(), std::move(children));
+}
 
 }  // namespace liquid_cache
 
