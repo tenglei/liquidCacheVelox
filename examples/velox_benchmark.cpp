@@ -52,6 +52,8 @@
 #include <arrow/compute/api.h>
 #include <arrow/io/file.h>
 
+#include <parquet/arrow/reader.h>
+
 #include "liquid_cache/liquid_cache_store.h"
 #include "liquid_cache/liquid_to_velox.h"
 
@@ -229,6 +231,43 @@ std::vector<InMemoryParquetFile> load_parquet_files_to_memory(
         mem_files.push_back({path, std::move(buffer)});
     }
     return mem_files;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Extract row group byte offsets for read_split_velox benchmark.
+// Mirrors load_from_parquet's FileRgMetadata population logic.
+// ═══════════════════════════════════════════════════════════════════════
+
+struct FileRgOffsets {
+    uint64_t file_id;
+    std::vector<uint64_t> offsets;  // byte offset of each RG (same logic as load_from_parquet)
+};
+
+std::vector<FileRgOffsets> extract_rg_offsets(
+        const std::vector<std::string>& file_paths) {
+    std::vector<FileRgOffsets> result;
+    for (const auto& path : file_paths) {
+        auto infile = arrow::io::ReadableFile::Open(path).ValueOrDie();
+        std::unique_ptr<parquet::arrow::FileReader> reader;
+        auto open_ok = parquet::arrow::OpenFile(
+            infile, arrow::default_memory_pool(), &reader).ok();
+        if (!open_ok) continue;
+
+        auto meta = reader->parquet_reader()->metadata();
+        int num_rgs = reader->num_row_groups();
+        FileRgOffsets fro;
+        fro.file_id = std::hash<std::string>{}(path);
+        fro.offsets.reserve(num_rgs);
+        for (int i = 0; i < num_rgs; ++i) {
+            auto rg_meta = meta->RowGroup(i);
+            auto off = static_cast<uint64_t>(rg_meta->file_offset());
+            if (off == 0 && rg_meta->num_columns() > 0)
+                off = static_cast<uint64_t>(rg_meta->ColumnChunk(0)->file_offset());
+            fro.offsets.push_back(off);
+        }
+        result.push_back(std::move(fro));
+    }
+    return result;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -420,6 +459,7 @@ void run_bench(const std::vector<InMemoryParquetFile>& mem_files,
                LiquidCacheStore& store,
                const std::vector<LiquidCacheStore::RowGroupInfo>& rg_infos,
                const vx::RowTypePtr& veloxRowType,
+               const std::vector<FileRgOffsets>& file_rg_offsets,
                vx::memory::MemoryPool* pool) {
     int num_cols = veloxRowType->size();
     auto scenarios = get_bench_scenarios(num_cols);
@@ -462,9 +502,11 @@ void run_bench(const std::vector<InMemoryParquetFile>& mem_files,
         int ncols;
         BenchStats pq_stats;
         BenchStats cache_stats;
+        BenchStats split_stats;
         double speedup;
         double cache_throughput_rows;  // rows/sec
         double cache_throughput_mb;    // MB/sec (approximate)
+        double split_speedup;
     };
     std::vector<ScenarioResult> results;
 
@@ -538,8 +580,47 @@ void run_bench(const std::vector<InMemoryParquetFile>& mem_files,
         }
         auto cache_stats = compute_stats(std::move(cache_samples));
 
+        // Liquid Cache read_split_velox: warmup + measure
+        for (int w = 0; w < WARMUP; ++w) {
+            for (const auto& fro : file_rg_offsets) {
+                for (size_t rg = 0; rg + 1 < fro.offsets.size(); ++rg) {
+                    uint64_t start = fro.offsets[rg];
+                    uint64_t len = fro.offsets[rg + 1] - fro.offsets[rg];
+                    auto vec = store.read_split_velox(
+                        fro.file_id, start, len, veloxRowType, pool, projection);
+                    benchmark_escape(vec);
+                }
+            }
+        }
+
+        std::vector<double> split_samples;
+        split_samples.reserve(ITERS);
+        size_t split_rows = 0;
+        for (int i = 0; i < ITERS; ++i) {
+            auto t0 = SteadyClock::now();
+            size_t iter_rows = 0;
+            for (const auto& fro : file_rg_offsets) {
+                for (size_t rg = 0; rg + 1 < fro.offsets.size(); ++rg) {
+                    uint64_t start = fro.offsets[rg];
+                    uint64_t len = fro.offsets[rg + 1] - fro.offsets[rg];
+                    auto vec = store.read_split_velox(
+                        fro.file_id, start, len, veloxRowType, pool, projection);
+                    if (vec) {
+                        iter_rows += vec->size();
+                        benchmark_escape(vec);
+                    }
+                }
+            }
+            auto t1 = SteadyClock::now();
+            split_samples.push_back(Duration(t1 - t0).count());
+            split_rows = iter_rows;
+        }
+        auto split_stats = compute_stats(std::move(split_samples));
+
         double speedup = (velox_reader_ok && cache_stats.mean > 1e-12)
                          ? pq_stats.mean / cache_stats.mean : 0;
+        double split_speedup = (velox_reader_ok && split_stats.mean > 1e-12)
+                               ? pq_stats.mean / split_stats.mean : 0;
 
         // Throughput: rows/sec and approximate MB/sec
         double cache_throughput_rows = (cache_stats.mean > 1e-12)
@@ -557,38 +638,41 @@ void run_bench(const std::vector<InMemoryParquetFile>& mem_files,
         } else {
             std::cout << "    Parquet->Velox:  (unavailable)\n";
         }
-        std::cout << "    Liquid->Velox:   " << fmt_time_ms(cache_stats.mean * 1000.0)
+        std::cout << "    Liquid(read_batch):  " << fmt_time_ms(cache_stats.mean * 1000.0)
                   << "  (med " << fmt_time_ms(cache_stats.median * 1000.0)
-                  << " ±" << fmt_time_ms(cache_stats.stddev * 1000.0)
-                  << ", CI±" << fmt_time_ms(cache_stats.ci_half * 1000.0) << ")\n";
+                  << ")\n";
+        std::cout << "    Liquid(read_split):  " << fmt_time_ms(split_stats.mean * 1000.0)
+                  << "  (med " << fmt_time_ms(split_stats.median * 1000.0)
+                  << ")\n";
         if (velox_reader_ok) {
-            std::cout << "    Speedup:         " << std::fixed << std::setprecision(2)
+            std::cout << "    Speedup(batch):      " << std::fixed << std::setprecision(2)
                       << speedup << "x\n";
+            std::cout << "    Speedup(split):      " << std::fixed << std::setprecision(2)
+                      << split_speedup << "x\n";
         }
-        std::cout << "    Throughput:      " << std::fixed << std::setprecision(0)
-                  << cache_throughput_rows << " rows/sec, ~"
-                  << std::setprecision(1) << cache_throughput_mb << " MB/sec (est.)\n";
 
-        results.push_back({sc.name, ncols, pq_stats, cache_stats, speedup,
-                           cache_throughput_rows, cache_throughput_mb});
+        results.push_back({sc.name, ncols, pq_stats, cache_stats, split_stats,
+                           speedup, cache_throughput_rows, cache_throughput_mb,
+                           split_speedup});
     }
 
     // Summary table
-    std::cout << "\n+-------------------------+-------+------------+------------+----------+-------------+\n";
-    std::cout <<   "|  Scenario               |  Cols | Parq->Velox| Liq->Velox | Speedup  | rows/sec    |\n";
-    std::cout <<   "+-------------------------+-------+------------+------------+----------+-------------+\n";
+    std::cout << "\n+-------------------------+-------+------------+------------+------------+----------+----------+\n";
+    std::cout <<   "|  Scenario               |  Cols | Parq->Velox| read_batch | read_split | Batch    | Split    |\n";
+    std::cout <<   "+-------------------------+-------+------------+------------+------------+----------+----------+\n";
     for (const auto& r : results) {
         std::cout << "|  " << std::left << std::setw(23) << r.name
                   << " | " << std::right << std::setw(5) << r.ncols
                   << " | " << fmt_time_ms_table(r.pq_stats.mean * 1000.0)
                   << " | " << fmt_time_ms_table(r.cache_stats.mean * 1000.0)
+                  << " | " << fmt_time_ms_table(r.split_stats.mean * 1000.0)
                   << " | " << std::setw(6) << std::fixed << std::setprecision(2)
                   << r.speedup << "x "
-                  << " | " << std::setw(9) << std::setprecision(0)
-                  << r.cache_throughput_rows
+                  << " | " << std::setw(6) << std::setprecision(2)
+                  << r.split_speedup << "x"
                   << " |\n";
     }
-    std::cout << "+-------------------------+-------+------------+------------+----------+-------------+\n";
+    std::cout << "+-------------------------+-------+------------+------------+------------+----------+----------+\n";
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -669,8 +753,11 @@ int main(int argc, char* argv[]) {
 
     const auto& rowType = cacheRowType ? cacheRowType : veloxRowType;
 
+    // Extract RG byte offsets for read_split_velox benchmark
+    auto file_rg_offsets = extract_rg_offsets(files);
+
     if (mode == "bench") {
-        run_bench(mem_files, store, rg_infos, rowType, pool.get());
+        run_bench(mem_files, store, rg_infos, rowType, file_rg_offsets, pool.get());
     } else if (mode == "verify") {
         run_verify(store, rg_infos, rowType, pool.get());
     } else {

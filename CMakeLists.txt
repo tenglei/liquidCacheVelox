@@ -554,7 +554,7 @@ if(LIQUID_BUILD_TESTS)
 
     # Velox cross-validation tests (only with Velox enabled)
     if(LIQUID_ENABLE_VELOX AND VELOX_PREFIX)
-        add_executable(liquid_velox_tests tests/test_velox_crossval.cpp)
+        add_executable(liquid_velox_tests tests/test_velox_crossval.cpp tests/test_pipeline_integration.cpp)
         target_include_directories(liquid_velox_tests PRIVATE
             ${CMAKE_SOURCE_DIR}/include
             ${VELOX_INCLUDE_DIRS}
