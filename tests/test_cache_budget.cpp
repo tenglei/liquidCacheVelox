@@ -296,3 +296,118 @@ TEST(CacheStore, SameKeyReinsert) {
     auto typed = std::static_pointer_cast<arrow::Int32Array>(got);
     EXPECT_EQ(typed->Value(0), 500);
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Row group boundary detection tests
+// Verifies that load_from_parquet correctly tracks actual Parquet
+// row group boundaries via cumulative row counts from footer metadata.
+// ═══════════════════════════════════════════════════════════════════════
+
+#include <arrow/io/file.h>
+#include <arrow/table.h>
+#include <parquet/arrow/writer.h>
+#include <parquet/arrow/reader.h>
+
+TEST(CacheStore, MultiRowGroupBoundaryTracking) {
+    // Create a small Arrow table that will be split into multiple row groups
+    const int rows_per_rg = 50;
+    const int num_rgs = 5;
+    const int total_rows = rows_per_rg * num_rgs;
+
+    arrow::Int32Builder i32_builder;
+    arrow::DoubleBuilder f64_builder;
+    for (int i = 0; i < total_rows; ++i) {
+        ARROW_CHECK_OK(i32_builder.Append(i));
+        ARROW_CHECK_OK(f64_builder.Append(static_cast<double>(i) * 1.5));
+    }
+    auto col0 = i32_builder.Finish().ValueOrDie();
+    auto col1 = f64_builder.Finish().ValueOrDie();
+    auto table = arrow::Table::Make(
+        arrow::schema({arrow::field("c0", arrow::int32()),
+                       arrow::field("c1", arrow::float64())}),
+        {col0, col1});
+
+    // Write to Parquet with explicit row groups for reliable multi-RG testing
+    std::string tmp_path = "/tmp/test_multi_rg_boundary.parquet";
+    {
+        auto maybe_out = arrow::io::FileOutputStream::Open(tmp_path);
+        ASSERT_TRUE(maybe_out.ok());
+        auto out = maybe_out.ValueOrDie();
+
+        auto writer_props = parquet::WriterProperties::Builder()
+            .max_row_group_length(rows_per_rg)->build();
+        auto arrow_props = parquet::ArrowWriterProperties::Builder().build();
+
+        auto maybe_writer = parquet::arrow::FileWriter::Open(
+            *table->schema(), arrow::default_memory_pool(),
+            out, writer_props, arrow_props);
+        ASSERT_TRUE(maybe_writer.ok());
+        auto writer = std::move(maybe_writer).ValueOrDie();
+
+        // Write each row group explicitly to guarantee multi-RG output
+        for (int rg = 0; rg < num_rgs; ++rg) {
+            int64_t start = rg * rows_per_rg;
+            auto chunk = table->Slice(start, rows_per_rg);
+            ARROW_CHECK_OK(writer->NewRowGroup(rows_per_rg));
+            for (int c = 0; c < chunk->num_columns(); ++c) {
+                ARROW_CHECK_OK(writer->WriteColumnChunk(
+                    *chunk->column(c)->chunk(0)));
+            }
+        }
+        ARROW_CHECK_OK(writer->Close());
+        ARROW_CHECK_OK(out->Close());
+    }
+
+    // Verify the file has the expected number of row groups
+    {
+        auto maybe_in = arrow::io::ReadableFile::Open(tmp_path);
+        ASSERT_TRUE(maybe_in.ok());
+        std::unique_ptr<parquet::arrow::FileReader> reader;
+        ASSERT_TRUE(parquet::arrow::OpenFile(
+            maybe_in.ValueOrDie(), arrow::default_memory_pool(), &reader).ok());
+        EXPECT_EQ(reader->num_row_groups(), num_rgs);
+    }
+
+    // Load via LiquidCacheStore and verify RowGroupInfo tracking
+    LiquidCacheStore store;
+    std::shared_ptr<arrow::Schema> schema;
+    double transcode_sec = 0;
+
+    auto rg_infos = store.load_from_parquet(
+        {tmp_path}, schema, transcode_sec,
+        [](const std::shared_ptr<arrow::Array>& arr) -> LiquidArrayRef {
+            return nullptr;  // store as raw Arrow (simplest path)
+        });
+
+    // Clean up temp file
+    std::remove(tmp_path.c_str());
+
+    // Verify row group count
+    ASSERT_EQ(rg_infos.size(), static_cast<size_t>(num_rgs))
+        << "Should have " << num_rgs << " RowGroupInfo entries, one per RG";
+
+    // Verify each RowGroupInfo has correct rg_id and row count
+    for (int i = 0; i < num_rgs; ++i) {
+        EXPECT_EQ(rg_infos[i].rg_id, static_cast<uint16_t>(i))
+            << "RowGroupInfo[" << i << "] should have rg_id=" << i;
+        EXPECT_EQ(rg_infos[i].total_rows, static_cast<size_t>(rows_per_rg))
+            << "RowGroupInfo[" << i << "] should have " << rows_per_rg << " rows";
+    }
+
+    // Verify cache entries use correct rg_id in their keys
+    // Each RG has 2 columns × some batches → entries with rg_id in ascending order
+    auto s = store.stats();
+    EXPECT_GT(s.entry_count, 0u) << "Should have cached entries";
+
+    // Spot-check: entries for RG 0 must exist, entries for non-existent RG must not
+    uint64_t fid = rg_infos[0].file_id;  // file_id from load_from_parquet (path hash)
+    LiquidCacheKey k_rg0(fid, 0, 0, 0);
+    LiquidCacheKey k_rg_last(fid, static_cast<uint16_t>(num_rgs - 1), 0, 0);
+    LiquidCacheKey k_rg_bad(fid, static_cast<uint16_t>(num_rgs), 0, 0);
+    EXPECT_TRUE(store.contains(k_rg0))
+        << "RG 0 col 0 batch 0 should be cached";
+    EXPECT_TRUE(store.contains(k_rg_last))
+        << "Last RG col 0 batch 0 should be cached";
+    EXPECT_FALSE(store.contains(k_rg_bad))
+        << "Row group " << num_rgs << " should not exist";
+}

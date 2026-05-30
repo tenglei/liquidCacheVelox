@@ -872,75 +872,69 @@ std::vector<LiquidCacheStore::RowGroupInfo> LiquidCacheStore::load_from_parquet(
             }
         }
 
-        std::shared_ptr<arrow::RecordBatchReader> batch_reader;
-#if ARROW_VERSION_MAJOR >= 19
-        auto rb_result = reader->GetRecordBatchReader();
-        if (!rb_result.ok()) { continue; }
-        batch_reader = std::move(rb_result).ValueOrDie();
-#else
-        auto rb_status = reader->GetRecordBatchReader(&batch_reader);
-        if (!rb_status.ok()) { continue; }
-#endif
-
         uint64_t file_id = std::hash<std::string>{}(path);
         int num_row_groups = reader->num_row_groups();
 
-        // Collect metadata + row group boundary info
+        // Collect row group file offsets for split->RG mapping
         FileRgMetadata fmeta;
         fmeta.rg_offsets.reserve(num_row_groups);
         fmeta.rg_row_counts.reserve(num_row_groups);
         {
             auto* pq_reader = reader->parquet_reader();
             auto meta = pq_reader->metadata();
-            uint64_t cum = 0;
             for (int i = 0; i < num_row_groups; ++i) {
                 auto rg_meta = meta->RowGroup(i);
                 auto off = static_cast<uint64_t>(rg_meta->file_offset());
                 if (off == 0 && rg_meta->num_columns() > 0)
                     off = static_cast<uint64_t>(rg_meta->ColumnChunk(0)->file_offset());
                 fmeta.rg_offsets.push_back(off);
-                cum += static_cast<uint64_t>(rg_meta->num_rows());
-                fmeta.rg_row_counts.push_back(cum);
+                fmeta.rg_row_counts.push_back(
+                    static_cast<uint64_t>(rg_meta->num_rows()));
             }
         }
 
-        uint16_t rg_id = 0;
-        uint16_t batch_id = 0;
-        size_t rg_rows = 0;
-        uint64_t cum_rows = 0;
+        // Read each row group independently for correct rg_id tracking
+        for (int rg_idx = 0; rg_idx < num_row_groups; ++rg_idx) {
+            std::shared_ptr<arrow::RecordBatchReader> rg_reader;
+#if ARROW_VERSION_MAJOR >= 19
+            auto rb_result = reader->GetRecordBatchReader({rg_idx});
+            if (!rb_result.ok()) { continue; }
+            rg_reader = std::move(rb_result).ValueOrDie();
+#else
+            auto rb_status = reader->GetRecordBatchReader({rg_idx}, &rg_reader);
+            if (!rb_status.ok()) { continue; }
+#endif
 
-        while (true) {
-            std::shared_ptr<arrow::RecordBatch> batch;
-            auto st = batch_reader->ReadNext(&batch);
-            if (!st.ok() || !batch) break;
+            uint16_t batch_id = 0;
+            size_t rg_rows = 0;
 
-            // Detect row group boundary from metadata
-            while (rg_id < static_cast<uint16_t>(num_row_groups - 1) &&
-                   cum_rows >= fmeta.rg_row_counts[rg_id]) {
-                rg_infos.push_back({file_id, rg_id, batch_id, rg_rows});
-                rg_id++;
-                batch_id = 0;
-                rg_rows = 0;
-            }
+            while (true) {
+                std::shared_ptr<arrow::RecordBatch> batch;
+                auto st = rg_reader->ReadNext(&batch);
+                if (!st.ok() || !batch) break;
 
-            rg_rows += batch->num_rows();
-            cum_rows += batch->num_rows();
+                rg_rows += batch->num_rows();
 
-            for (int c = 0; c < batch->num_columns(); ++c) {
-                LiquidCacheKey key(file_id, rg_id,
-                                   static_cast<uint16_t>(c), batch_id);
-                auto liquid = transcode_fn(batch->column(c));
-                std::lock_guard<std::mutex> lock(mutex_);
-                if (liquid) {
-                    entries_[key] = CacheEntry::from_liquid(std::move(liquid));
-                } else {
-                    entries_[key] = CacheEntry::from_arrow(batch->column(c));
+                for (int c = 0; c < batch->num_columns(); ++c) {
+                    LiquidCacheKey key(file_id,
+                                       static_cast<uint16_t>(rg_idx),
+                                       static_cast<uint16_t>(c), batch_id);
+                    auto liquid = transcode_fn(batch->column(c));
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    if (liquid) {
+                        entries_[key] = CacheEntry::from_liquid(std::move(liquid));
+                    } else {
+                        entries_[key] = CacheEntry::from_arrow(batch->column(c));
+                    }
                 }
+                ++batch_id;
             }
-            ++batch_id;
+
+            rg_infos.push_back({file_id,
+                                static_cast<uint16_t>(rg_idx),
+                                batch_id, rg_rows});
         }
 
-        rg_infos.push_back({file_id, rg_id, batch_id, rg_rows});
         file_metadata_[file_id] = std::move(fmeta);
     }
 
@@ -994,83 +988,77 @@ std::vector<LiquidCacheStore::RowGroupInfo> LiquidCacheStore::load_from_parquet(
             }
         }
 
-        std::shared_ptr<arrow::RecordBatchReader> batch_reader;
-#if ARROW_VERSION_MAJOR >= 19
-        auto rb_result = reader->GetRecordBatchReader();
-        if (!rb_result.ok()) { continue; }
-        batch_reader = std::move(rb_result).ValueOrDie();
-#else
-        auto rb_status = reader->GetRecordBatchReader(&batch_reader);
-        if (!rb_status.ok()) { continue; }
-#endif
-
         uint64_t file_id = std::hash<std::string>{}(path);
         int num_row_groups = reader->num_row_groups();
 
-        // Collect metadata + row group boundary info
+        // Collect row group file offsets for split->RG mapping
         FileRgMetadata fmeta;
         fmeta.rg_offsets.reserve(num_row_groups);
         fmeta.rg_row_counts.reserve(num_row_groups);
         {
             auto* pq_reader = reader->parquet_reader();
             auto meta = pq_reader->metadata();
-            uint64_t cum = 0;
             for (int i = 0; i < num_row_groups; ++i) {
                 auto rg_meta = meta->RowGroup(i);
                 auto off = static_cast<uint64_t>(rg_meta->file_offset());
                 if (off == 0 && rg_meta->num_columns() > 0)
                     off = static_cast<uint64_t>(rg_meta->ColumnChunk(0)->file_offset());
                 fmeta.rg_offsets.push_back(off);
-                cum += static_cast<uint64_t>(rg_meta->num_rows());
-                fmeta.rg_row_counts.push_back(cum);
+                fmeta.rg_row_counts.push_back(
+                    static_cast<uint64_t>(rg_meta->num_rows()));
             }
         }
 
-        uint16_t rg_id = 0;
-        uint16_t batch_id = 0;
-        size_t rg_rows = 0;
-        uint64_t cum_rows = 0;
+        // Read each row group independently for correct rg_id tracking
+        for (int rg_idx = 0; rg_idx < num_row_groups; ++rg_idx) {
+            std::shared_ptr<arrow::RecordBatchReader> rg_reader;
+#if ARROW_VERSION_MAJOR >= 19
+            auto rb_result = reader->GetRecordBatchReader({rg_idx});
+            if (!rb_result.ok()) { continue; }
+            rg_reader = std::move(rb_result).ValueOrDie();
+#else
+            auto rb_status = reader->GetRecordBatchReader({rg_idx}, &rg_reader);
+            if (!rb_status.ok()) { continue; }
+#endif
 
-        while (true) {
-            std::shared_ptr<arrow::RecordBatch> batch;
-            auto st = batch_reader->ReadNext(&batch);
-            if (!st.ok() || !batch) break;
+            uint16_t batch_id = 0;
+            size_t rg_rows = 0;
 
-            // Detect row group boundary from metadata
-            while (rg_id < static_cast<uint16_t>(num_row_groups - 1) &&
-                   cum_rows >= fmeta.rg_row_counts[rg_id]) {
-                rg_infos.push_back({file_id, rg_id, batch_id, rg_rows});
-                rg_id++;
-                batch_id = 0;
-                rg_rows = 0;
+            while (true) {
+                std::shared_ptr<arrow::RecordBatch> batch;
+                auto st = rg_reader->ReadNext(&batch);
+                if (!st.ok() || !batch) break;
+
+                rg_rows += batch->num_rows();
+
+                for (int c = 0; c < batch->num_columns(); ++c) {
+                    LiquidCacheKey key(file_id,
+                                       static_cast<uint16_t>(rg_idx),
+                                       static_cast<uint16_t>(c), batch_id);
+
+                    // Use per-column compressor state for FSST reuse
+                    LiquidCompressorStates* states = nullptr;
+                    if (c < static_cast<int>(compressor_states.size())) {
+                        states = compressor_states[c].get();
+                    }
+                    auto liquid = transcode_to_liquid_array(
+                        batch->column(c), states);
+
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    if (liquid) {
+                        entries_[key] = CacheEntry::from_liquid(std::move(liquid));
+                    } else {
+                        entries_[key] = CacheEntry::from_arrow(batch->column(c));
+                    }
+                }
+                ++batch_id;
             }
 
-            rg_rows += batch->num_rows();
-            cum_rows += batch->num_rows();
-
-            for (int c = 0; c < batch->num_columns(); ++c) {
-                LiquidCacheKey key(file_id, rg_id,
-                                   static_cast<uint16_t>(c), batch_id);
-
-                // Use per-column compressor state for FSST reuse
-                LiquidCompressorStates* states = nullptr;
-                if (c < static_cast<int>(compressor_states.size())) {
-                    states = compressor_states[c].get();
-                }
-                auto liquid = transcode_to_liquid_array(
-                    batch->column(c), states);
-
-                std::lock_guard<std::mutex> lock(mutex_);
-                if (liquid) {
-                    entries_[key] = CacheEntry::from_liquid(std::move(liquid));
-                } else {
-                    entries_[key] = CacheEntry::from_arrow(batch->column(c));
-                }
-            }
-            ++batch_id;
+            rg_infos.push_back({file_id,
+                                static_cast<uint16_t>(rg_idx),
+                                batch_id, rg_rows});
         }
 
-        rg_infos.push_back({file_id, rg_id, batch_id, rg_rows});
         file_metadata_[file_id] = std::move(fmeta);
     }
 

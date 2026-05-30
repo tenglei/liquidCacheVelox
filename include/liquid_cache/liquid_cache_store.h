@@ -78,7 +78,7 @@ struct LiquidCacheKeyHash {
 
 struct FileRgMetadata {
     std::vector<uint64_t> rg_offsets;     // file_offset of each row group
-    std::vector<uint64_t> rg_row_counts;  // cumulative row count per row group
+    std::vector<uint64_t> rg_row_counts;  // num_rows of each row group
 };
 
 }  // namespace liquid_cache
