@@ -878,18 +878,22 @@ std::vector<LiquidCacheStore::RowGroupInfo> LiquidCacheStore::load_from_parquet(
         // Collect row group file offsets for split->RG mapping
         FileRgMetadata fmeta;
         fmeta.rg_offsets.reserve(num_row_groups);
-        fmeta.rg_row_counts.reserve(num_row_groups);
         {
             auto* pq_reader = reader->parquet_reader();
             auto meta = pq_reader->metadata();
             for (int i = 0; i < num_row_groups; ++i) {
                 auto rg_meta = meta->RowGroup(i);
                 auto off = static_cast<uint64_t>(rg_meta->file_offset());
-                if (off == 0 && rg_meta->num_columns() > 0)
-                    off = static_cast<uint64_t>(rg_meta->ColumnChunk(0)->data_page_offset());
+                if (off == 0 && rg_meta->num_columns() > 0) {
+                    auto cc0 = rg_meta->ColumnChunk(0);
+                    // Match Velox's 3-tier fallback in filterRowGroups():
+                    // file_offset → dictionary_page_offset → data_page_offset
+                    if (cc0->has_dictionary_page())
+                        off = static_cast<uint64_t>(cc0->dictionary_page_offset());
+                    else
+                        off = static_cast<uint64_t>(cc0->data_page_offset());
+                }
                 fmeta.rg_offsets.push_back(off);
-                fmeta.rg_row_counts.push_back(
-                    static_cast<uint64_t>(rg_meta->num_rows()));
             }
         }
 
@@ -994,18 +998,22 @@ std::vector<LiquidCacheStore::RowGroupInfo> LiquidCacheStore::load_from_parquet(
         // Collect row group file offsets for split->RG mapping
         FileRgMetadata fmeta;
         fmeta.rg_offsets.reserve(num_row_groups);
-        fmeta.rg_row_counts.reserve(num_row_groups);
         {
             auto* pq_reader = reader->parquet_reader();
             auto meta = pq_reader->metadata();
             for (int i = 0; i < num_row_groups; ++i) {
                 auto rg_meta = meta->RowGroup(i);
                 auto off = static_cast<uint64_t>(rg_meta->file_offset());
-                if (off == 0 && rg_meta->num_columns() > 0)
-                    off = static_cast<uint64_t>(rg_meta->ColumnChunk(0)->data_page_offset());
+                if (off == 0 && rg_meta->num_columns() > 0) {
+                    auto cc0 = rg_meta->ColumnChunk(0);
+                    // Match Velox's 3-tier fallback in filterRowGroups():
+                    // file_offset → dictionary_page_offset → data_page_offset
+                    if (cc0->has_dictionary_page())
+                        off = static_cast<uint64_t>(cc0->dictionary_page_offset());
+                    else
+                        off = static_cast<uint64_t>(cc0->data_page_offset());
+                }
                 fmeta.rg_offsets.push_back(off);
-                fmeta.rg_row_counts.push_back(
-                    static_cast<uint64_t>(rg_meta->num_rows()));
             }
         }
 

@@ -207,6 +207,14 @@ static std::shared_ptr<arrow::Array> GenStringVaried(int n) {
     return b.Finish().ValueOrDie();
 }
 
+/// Generate a string column with few distinct values (forcing dictionary encoding).
+static std::shared_ptr<arrow::Array> GenStringDict(int n, int num_distinct = 8) {
+    arrow::StringBuilder b;
+    for (int i = 0; i < n; ++i)
+        APPEND(b, "val_" + std::to_string(i % num_distinct));
+    return b.Finish().ValueOrDie();
+}
+
 /// Generate an all-null column
 static std::shared_ptr<arrow::Array> GenAllNull(int n, arrow::Type::type type_id) {
     switch (type_id) {
@@ -1334,7 +1342,8 @@ TEST(ReadSplitVelox, SparkStyleParquet_MultiRG) {
     LiquidCacheStore store;
     auto rowType = LoadAndVerifyAllBatches(store, path, schema, cols);
 
-    // Compute correct offsets using data_page_offset (what Velox uses)
+    // Compute correct offsets using Velox's 3-tier fallback:
+    // file_offset → dictionary_page_offset → data_page_offset
     auto maybe_in2 = arrow::io::ReadableFile::Open(path);
     ASSERT_TRUE(maybe_in2.ok());
     std::unique_ptr<parquet::arrow::FileReader> reader2;
@@ -1342,17 +1351,22 @@ TEST(ReadSplitVelox, SparkStyleParquet_MultiRG) {
         maybe_in2.ValueOrDie(), arrow::default_memory_pool(), &reader2).ok());
     auto meta2 = reader2->parquet_reader()->metadata();
 
-    std::vector<uint64_t> correct_offsets;
+    std::vector<uint64_t> velox_offsets;
     for (int i = 0; i < num_rgs; ++i) {
         auto rg = meta2->RowGroup(i);
-        int64_t dpo = rg->ColumnChunk(0)->data_page_offset();
-        ASSERT_GT(dpo, 0);
-        correct_offsets.push_back(static_cast<uint64_t>(dpo));
+        auto cc0 = rg->ColumnChunk(0);
+        int64_t voff;
+        if (cc0->has_dictionary_page())
+            voff = cc0->dictionary_page_offset();
+        else
+            voff = cc0->data_page_offset();
+        ASSERT_GT(voff, 0) << "RG " << i;
+        velox_offsets.push_back(static_cast<uint64_t>(voff));
     }
 
-    // Query RGs 0+1 using data_page_offset-based range
-    uint64_t start = correct_offsets[0];
-    uint64_t length = correct_offsets[2] - correct_offsets[0];
+    // Query RGs 0+1
+    uint64_t start = velox_offsets[0];
+    uint64_t length = velox_offsets[2] - velox_offsets[0];
 
     auto vec = store.read_split_velox(file_id, start, length,
                                        rowType, test_pool());
@@ -1366,6 +1380,116 @@ TEST(ReadSplitVelox, SparkStyleParquet_MultiRG) {
 
     AssertInt32Matches(rowVec->childAt(0), cols[0], 0, rows_per_rg * 2);
     AssertFloat64Matches(rowVec->childAt(1), cols[1], 0, rows_per_rg * 2);
+
+    std::remove(path.c_str());
+}
+
+/// Verify that read_split_velox uses dictionary_page_offset() as intermediate
+/// fallback (matching Velox's 3-tier chain: file_offset → dict_page_offset →
+/// data_page_offset). Tests with string columns that have dictionary pages.
+TEST(ReadSplitVelox, SparkStyleParquet_DictPageFallback) {
+    const int rows_per_rg = 50;
+    const int num_rgs = 3;
+    const int n = rows_per_rg * num_rgs;
+
+    // String column FIRST (col 0) with few distinct values → dictionary encoding.
+    // The RG offset fallback reads ColumnChunk(0) — this must have dict pages
+    // to exercise the dictionary_page_offset intermediate tier.
+    auto schema = arrow::schema({
+        arrow::field("c0_str", arrow::utf8()),
+        arrow::field("c1_int", arrow::int32()),
+    });
+    std::vector<std::shared_ptr<arrow::Array>> cols = {
+        GenStringDict(n, 8),  // 8 distinct strings → dictionary in col 0
+        GenInt32(n)
+    };
+
+    std::string path = "/tmp/test_split_dict_fallback.parquet";
+    uint64_t file_id = WriteParquetFileSparkStyle(path, schema, cols, rows_per_rg);
+
+    // Verify dictionary pages exist on col 0 (string, first column)
+    bool has_dict_pages = false;
+    {
+        auto maybe_in = arrow::io::ReadableFile::Open(path);
+        ASSERT_TRUE(maybe_in.ok());
+        std::unique_ptr<parquet::arrow::FileReader> pq_reader;
+        ASSERT_TRUE(parquet::arrow::OpenFile(
+            maybe_in.ValueOrDie(), arrow::default_memory_pool(), &pq_reader).ok());
+        auto meta = pq_reader->parquet_reader()->metadata();
+
+        for (int i = 0; i < num_rgs; ++i) {
+            auto rg = meta->RowGroup(i);
+            EXPECT_EQ(rg->file_offset(), 0);
+            auto cc0 = rg->ColumnChunk(0);  // string col
+            if (cc0->has_dictionary_page()) {
+                has_dict_pages = true;
+                EXPECT_GT(cc0->dictionary_page_offset(), 0);
+                EXPECT_LT(cc0->dictionary_page_offset(),
+                          cc0->data_page_offset())
+                    << "dict page must precede data pages";
+            }
+            EXPECT_GT(cc0->data_page_offset(), 0);
+        }
+    }
+
+    if (!has_dict_pages) {
+        // Arrow didn't use dictionary encoding — skip the dict-specific checks
+        std::remove(path.c_str());
+        GTEST_SKIP() << "Arrow writer did not produce dictionary pages";
+        return;
+    }
+
+    // Load into cache — exercises the 3-tier fallback chain
+    LiquidCacheStore store;
+    {
+        std::shared_ptr<arrow::Schema> loaded_schema;
+        double transcode_sec = 0;
+        auto rg_infos = store.load_from_parquet(
+            {path}, loaded_schema, transcode_sec);
+        ASSERT_GT(rg_infos.size(), 0);
+    }
+    auto rowType = arrow_schema_to_velox_row_type(
+        std::make_shared<arrow::Schema>(*schema));
+
+    // Compute offsets matching Velox's 3-tier fallback:
+    //   file_offset (0 → fall through)
+    //   → dictionary_page_offset (if set) ← THIS IS THE KEY TIER
+    //   → data_page_offset
+    auto maybe_in2 = arrow::io::ReadableFile::Open(path);
+    ASSERT_TRUE(maybe_in2.ok());
+    std::unique_ptr<parquet::arrow::FileReader> reader2;
+    ASSERT_TRUE(parquet::arrow::OpenFile(
+        maybe_in2.ValueOrDie(), arrow::default_memory_pool(), &reader2).ok());
+    auto meta2 = reader2->parquet_reader()->metadata();
+
+    std::vector<uint64_t> velox_offsets;
+    for (int i = 0; i < num_rgs; ++i) {
+        auto rg = meta2->RowGroup(i);
+        auto cc0 = rg->ColumnChunk(0);  // string col — may have dict pages
+        int64_t voff;
+        if (cc0->has_dictionary_page() && cc0->dictionary_page_offset() > 0)
+            voff = cc0->dictionary_page_offset();   // Velox uses this first
+        else
+            voff = cc0->data_page_offset();
+        ASSERT_GT(voff, 0);
+        velox_offsets.push_back(static_cast<uint64_t>(voff));
+    }
+
+    // Query first 2 RGs using Velox-compatible offsets
+    uint64_t start = velox_offsets[0];
+    uint64_t length = velox_offsets[2] - velox_offsets[0];
+
+    auto vec = store.read_split_velox(file_id, start, length,
+                                       rowType, test_pool());
+    ASSERT_NE(vec, nullptr)
+        << "dict_page_offset fallback bug: getRowGroupsForRange returned empty. "
+        << "We store data_page_offset but Velox uses dictionary_page_offset.";
+    auto rowVec = std::dynamic_pointer_cast<RowVector>(vec);
+    ASSERT_NE(rowVec, nullptr);
+    EXPECT_EQ(rowVec->size(), rows_per_rg * 2);
+
+    AssertStringMatches(rowVec->childAt(0), cols[0], 0, rows_per_rg * 2);
+    AssertInt32Matches(rowVec->childAt(1), cols[1], 0, rows_per_rg * 2);
 
     std::remove(path.c_str());
 }
