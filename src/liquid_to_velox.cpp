@@ -358,6 +358,17 @@ VectorPtr LiquidByteViewArray::to_velox(
     const auto* dict_flat_offsets = dict.flat_offsets.data();
     const auto* dict_lens = dict.lengths.data();
 
+    // Pre-build StringViews for all dictionary entries.
+    // Collapses per-element StringView(dict_flat + offset, len) — which does
+    // two indirect lookups and a branch inside StringView(char*, int) — into
+    // a single dict_sv[keys[i]] copy (16-byte memcpy, no branch).
+    std::vector<StringView> dict_sv(dict_size);
+    for (size_t d = 0; d < dict_size; ++d) {
+        dict_sv[d] = StringView(
+            reinterpret_cast<const char*>(dict_flat) + dict_flat_offsets[d],
+            dict_lens[d]);
+    }
+
     // Phase B: Bulk unpack all dictionary keys
     std::vector<uint16_t> keys(len);
     dictionary_keys_.bulk_unpack_to(keys.data());
@@ -365,12 +376,7 @@ VectorPtr LiquidByteViewArray::to_velox(
     auto nulls = copy_null_bitmap_to_velox(dictionary_keys_, pool);
 
     // ── DictionaryVector path for low-cardinality dictionaries ────────
-    // When the dictionary is significantly smaller than the array,
-    // output a DictionaryVector<StringView> instead of copying strings
-    // into a FlatVector.  This avoids O(N) memcpy per decode.
     if (dict_size > 0 && dict_size < len / 2) {
-        // Build the base FlatVector<StringView> from dictionary entries.
-        // Zero-copy: wrap flat_data with BufferView, keep cached_dict_ alive
         auto cached_dict = cached_dict_;  // shared_ptr copy extends lifetime
         auto dictStringBuf = BufferView<DecompressedDict::DictReleaser>::create(
             dict_flat, dict.flat_data.size(),
@@ -379,18 +385,14 @@ VectorPtr LiquidByteViewArray::to_velox(
         auto dictValuesBuf = AlignedBuffer::allocate<StringView>(
             static_cast<vector_size_t>(dict_size), pool);
         auto* dictRawViews = dictValuesBuf->template asMutable<StringView>();
-
-        for (size_t d = 0; d < dict_size; ++d) {
-            dictRawViews[d] = StringView(
-                reinterpret_cast<const char*>(dict_flat) + dict_flat_offsets[d],
-                dict_lens[d]);
-        }
+        std::memcpy(dictRawViews, dict_sv.data(),
+                    dict_size * sizeof(StringView));
 
         auto dictVec = std::make_shared<FlatVector<StringView>>(
             pool, veloxType, nullptr,
             static_cast<vector_size_t>(dict_size), dictValuesBuf,
             std::vector<BufferPtr>{dictStringBuf});
-        // Convert uint16 keys to vector_size_t indices.
+
         auto indices = AlignedBuffer::allocate<vector_size_t>(
             static_cast<vector_size_t>(len), pool);
         auto* rawIndices = indices->template asMutable<vector_size_t>();
@@ -405,22 +407,16 @@ VectorPtr LiquidByteViewArray::to_velox(
     }
 
     // ── FlatVector path for high-cardinality dictionaries ─────────────
-    // Zero-copy: StringViews point directly into dict.flat_data.
-    // BufferView with DictReleaser keeps flat_data alive.
     auto cached_dict = cached_dict_;  // shared_ptr copy extends lifetime
 
     auto valuesBuf = AlignedBuffer::allocate<StringView>(len, pool);
     auto* rawValues = valuesBuf->template asMutable<StringView>();
 
-    // Single pass: build StringViews, no memcpy
+    // Single pass: copy pre-built StringViews, no per-element construction
+    bool has_nulls = dictionary_keys_.has_nulls();
     for (uint32_t i = 0; i < len; ++i) {
-        if (!dictionary_keys_.is_null(i) && keys[i] < dict_size) {
-            uint16_t key = keys[i];
-            rawValues[i] = StringView(
-                reinterpret_cast<const char*>(dict_flat) + dict_flat_offsets[key],
-                dict_lens[key]);
-        } else {
-            rawValues[i] = StringView();
+        if (!has_nulls || !dictionary_keys_.is_null(i)) {
+            rawValues[i] = dict_sv[keys[i]];
         }
     }
 
