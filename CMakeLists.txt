@@ -555,9 +555,14 @@ if(LIQUID_BUILD_TESTS)
     # Velox cross-validation tests (only with Velox enabled)
     if(LIQUID_ENABLE_VELOX AND VELOX_PREFIX)
         add_executable(liquid_velox_tests tests/test_velox_crossval.cpp tests/test_pipeline_integration.cpp)
+        # Arrow source path for generated/parquet_types.h (needed by
+        # Spark-style Parquet test helper that strips file_offset fields).
+        set(_VELOX_ARROW_SRC "${VELOX_PREFIX}/CMake/resolve_dependency_modules/arrow/arrow_ep/src/arrow_ep/cpp/src")
         target_include_directories(liquid_velox_tests PRIVATE
             ${CMAKE_SOURCE_DIR}/include
             ${VELOX_INCLUDE_DIRS}
+            ${_VELOX_ARROW_SRC}
+            ${_VELOX_ARROW_SRC}/generated
         )
         target_compile_definitions(liquid_velox_tests PRIVATE LIQUID_ENABLE_VELOX NDEBUG)
         target_compile_options(liquid_velox_tests PRIVATE -mavx2 -mfma -mavx -mf16c -mlzcnt -mbmi2)

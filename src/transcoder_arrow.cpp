@@ -886,7 +886,7 @@ std::vector<LiquidCacheStore::RowGroupInfo> LiquidCacheStore::load_from_parquet(
                 auto rg_meta = meta->RowGroup(i);
                 auto off = static_cast<uint64_t>(rg_meta->file_offset());
                 if (off == 0 && rg_meta->num_columns() > 0)
-                    off = static_cast<uint64_t>(rg_meta->ColumnChunk(0)->file_offset());
+                    off = static_cast<uint64_t>(rg_meta->ColumnChunk(0)->data_page_offset());
                 fmeta.rg_offsets.push_back(off);
                 fmeta.rg_row_counts.push_back(
                     static_cast<uint64_t>(rg_meta->num_rows()));
@@ -1002,7 +1002,7 @@ std::vector<LiquidCacheStore::RowGroupInfo> LiquidCacheStore::load_from_parquet(
                 auto rg_meta = meta->RowGroup(i);
                 auto off = static_cast<uint64_t>(rg_meta->file_offset());
                 if (off == 0 && rg_meta->num_columns() > 0)
-                    off = static_cast<uint64_t>(rg_meta->ColumnChunk(0)->file_offset());
+                    off = static_cast<uint64_t>(rg_meta->ColumnChunk(0)->data_page_offset());
                 fmeta.rg_offsets.push_back(off);
                 fmeta.rg_row_counts.push_back(
                     static_cast<uint64_t>(rg_meta->num_rows()));

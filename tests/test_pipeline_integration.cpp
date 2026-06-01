@@ -1179,6 +1179,199 @@ TEST(FSSTPath, AutoReuse) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// 7. SparkParquet tests — verify data_page_offset() fallback
+//    for Spark/Hadoop-generated Parquet (no file_offset field).
+// ═══════════════════════════════════════════════════════════════════════
+
+#ifdef LIQUID_ENABLE_VELOX
+// For constructing Spark-style Parquet (file_offset stripped).
+// parquet_types.h is the thrift-generated C++ types mirroring parquet.thrift.
+// It lives in Arrow's build tree (not installed), so we add the generated/
+// dir to the test's include path via CMakeLists.txt.
+#define SIGNED_RIGHT_SHIFT_IS 1
+#define ARITHMETIC_RIGHT_SHIFT 1
+#include <thrift/protocol/TCompactProtocol.h>
+#include <thrift/transport/TBufferTransports.h>
+#include <parquet_types.h>
+
+namespace {
+
+/// Write a Parquet file with file_offset stripped from all RowGroups
+/// and ColumnChunks — mimicking Spark/Hadoop Parquet writer behavior.
+///
+/// Spark's Hadoop Parquet Writer does NOT populate the optional
+/// RowGroup.file_offset / ColumnChunk.file_offset thrift fields.
+/// Arrow's parquet::arrow::FileWriter always populates them.
+///
+/// This helper writes a normal Arrow Parquet, then modifies the
+/// thrift footer to remove both file_offset fields, producing a
+/// file that matches Spark's output.
+///
+/// Used to verify that load_from_parquet falls back to
+/// ColumnChunkMetaData::data_page_offset() — the same fallback
+/// Velox's ParquetReader::filterRowGroups() uses.
+static uint64_t WriteParquetFileSparkStyle(
+        const std::string& path,
+        const std::shared_ptr<arrow::Schema>& schema,
+        const std::vector<std::shared_ptr<arrow::Array>>& columns,
+        int rows_per_rg) {
+    using ThriftBuf = apache::thrift::transport::TMemoryBuffer;
+    using TCompactProto =
+        apache::thrift::protocol::TCompactProtocolT<ThriftBuf>;
+
+    // 1. Write normal Parquet (Arrow populates file_offset)
+    std::string tmp = path + ".tmp";
+    uint64_t file_id = WriteParquetFile(tmp, schema, columns, rows_per_rg);
+
+    // 2. Read entire file into memory
+    auto maybe_in = arrow::io::ReadableFile::Open(tmp);
+    if (!maybe_in.ok()) throw std::runtime_error("SparkStyle: cannot open tmp");
+    auto input = std::move(maybe_in).ValueOrDie();
+
+    auto sz = input->GetSize();
+    if (!sz.ok()) throw std::runtime_error("SparkStyle: cannot get size");
+    int64_t file_size = *sz;
+
+    auto buf_res = input->ReadAt(0, file_size);
+    if (!buf_res.ok()) throw std::runtime_error("SparkStyle: cannot read file");
+    auto file_buf = std::move(buf_res).ValueOrDie();
+    ARROW_CHECK_OK(input->Close());
+
+    const uint8_t* data = file_buf->data();
+
+    // 3. Extract footer: last 4 bytes = "PAR1", preceding 4 = footer_len (LE)
+    uint32_t footer_len;
+    memcpy(&footer_len, data + file_size - 8, 4);
+    const uint8_t* footer_start = data + file_size - 8 - footer_len;
+
+    // 4. Deserialize → thrift FileMetaData
+    auto read_buf = std::make_shared<ThriftBuf>(
+            const_cast<uint8_t*>(footer_start), footer_len,
+            ThriftBuf::OBSERVE);
+    TCompactProto read_proto(read_buf);
+    parquet::format::FileMetaData fmd;
+    fmd.read(&read_proto);
+
+    // 5. Strip file_offset from all RowGroups and ColumnChunks.
+    //    RowGroup.file_offset is optional → clear __isset to make it absent.
+    //    ColumnChunk.file_offset is required → set to 0 (Spark behavior).
+    for (auto& rg : fmd.row_groups) {
+        rg.__isset.file_offset = false;
+        rg.file_offset = 0;
+        for (auto& cc : rg.columns) {
+            cc.file_offset = 0;
+        }
+    }
+
+    // 6. Re-serialize footer
+    auto write_buf = std::make_shared<ThriftBuf>();
+    TCompactProto write_proto(write_buf);
+    fmd.write(&write_proto);
+    uint8_t* new_footer = nullptr;
+    uint32_t new_footer_len = 0;
+    write_buf->getBuffer(&new_footer, &new_footer_len);
+
+    // 7. Write new file: data pages + new footer + footer_len + "PAR1"
+    auto maybe_out = arrow::io::FileOutputStream::Open(path);
+    if (!maybe_out.ok()) throw std::runtime_error("SparkStyle: cannot create out");
+    auto output = std::move(maybe_out).ValueOrDie();
+
+    int64_t data_size = file_size - 8 - footer_len;
+    ARROW_CHECK_OK(output->Write(data, data_size));
+    ARROW_CHECK_OK(output->Write(new_footer, new_footer_len));
+    ARROW_CHECK_OK(output->Write(&new_footer_len, 4));
+    ARROW_CHECK_OK(output->Write("PAR1", 4));
+    ARROW_CHECK_OK(output->Close());
+
+    std::remove(tmp.c_str());
+    return std::hash<std::string>{}(path);  // hash of FINAL path, not tmp
+}
+
+}  // anonymous namespace
+
+/// Verify that read_split_velox works with Spark-style Parquet files
+/// where RowGroup.file_offset and ColumnChunk.file_offset are NOT set.
+/// This tests the data_page_offset() fallback in load_from_parquet.
+TEST(ReadSplitVelox, SparkStyleParquet_MultiRG) {
+    const int rows_per_rg = 100;
+    const int num_rgs = 3;
+    const int n = rows_per_rg * num_rgs;
+
+    auto schema = arrow::schema({
+        arrow::field("c0", arrow::int32()),
+        arrow::field("c1", arrow::float64()),
+    });
+    std::vector<std::shared_ptr<arrow::Array>> cols = {
+        GenInt32(n), GenFloat64(n)
+    };
+
+    std::string path = "/tmp/test_split_spark_style.parquet";
+
+    // Write WITHOUT file_offset fields (Spark/Hadoop behavior)
+    uint64_t file_id = WriteParquetFileSparkStyle(path, schema, cols, rows_per_rg);
+
+    // Verify the file actually has file_offset == 0
+    {
+        auto maybe_in = arrow::io::ReadableFile::Open(path);
+        ASSERT_TRUE(maybe_in.ok());
+        std::unique_ptr<parquet::arrow::FileReader> pq_reader;
+        ASSERT_TRUE(parquet::arrow::OpenFile(
+            maybe_in.ValueOrDie(), arrow::default_memory_pool(), &pq_reader).ok());
+        auto meta = pq_reader->parquet_reader()->metadata();
+        ASSERT_EQ(meta->num_row_groups(), num_rgs);
+        for (int i = 0; i < num_rgs; ++i) {
+            auto rg = meta->RowGroup(i);
+            EXPECT_EQ(rg->file_offset(), 0)
+                << "RowGroup " << i << " file_offset should be 0 (stripped)";
+            EXPECT_EQ(rg->ColumnChunk(0)->file_offset(), 0)
+                << "ColumnChunk " << i << " file_offset should be 0 (stripped)";
+            EXPECT_GT(rg->ColumnChunk(0)->data_page_offset(), 0)
+                << "data_page_offset should still be populated";
+        }
+    }
+
+    // Load into cache — this exercises the data_page_offset() fallback
+    LiquidCacheStore store;
+    auto rowType = LoadAndVerifyAllBatches(store, path, schema, cols);
+
+    // Compute correct offsets using data_page_offset (what Velox uses)
+    auto maybe_in2 = arrow::io::ReadableFile::Open(path);
+    ASSERT_TRUE(maybe_in2.ok());
+    std::unique_ptr<parquet::arrow::FileReader> reader2;
+    ASSERT_TRUE(parquet::arrow::OpenFile(
+        maybe_in2.ValueOrDie(), arrow::default_memory_pool(), &reader2).ok());
+    auto meta2 = reader2->parquet_reader()->metadata();
+
+    std::vector<uint64_t> correct_offsets;
+    for (int i = 0; i < num_rgs; ++i) {
+        auto rg = meta2->RowGroup(i);
+        int64_t dpo = rg->ColumnChunk(0)->data_page_offset();
+        ASSERT_GT(dpo, 0);
+        correct_offsets.push_back(static_cast<uint64_t>(dpo));
+    }
+
+    // Query RGs 0+1 using data_page_offset-based range
+    uint64_t start = correct_offsets[0];
+    uint64_t length = correct_offsets[2] - correct_offsets[0];
+
+    auto vec = store.read_split_velox(file_id, start, length,
+                                       rowType, test_pool());
+    ASSERT_NE(vec, nullptr)
+        << "Cache miss! Bug: rg_offsets stored as 0 (wrong fallback), "
+        << "so getRowGroupsForRange returned empty.";
+    auto rowVec = std::dynamic_pointer_cast<RowVector>(vec);
+    ASSERT_NE(rowVec, nullptr);
+    EXPECT_EQ(rowVec->size(), rows_per_rg * 2)
+        << "Should return RGs 0 and 1";
+
+    AssertInt32Matches(rowVec->childAt(0), cols[0], 0, rows_per_rg * 2);
+    AssertFloat64Matches(rowVec->childAt(1), cols[1], 0, rows_per_rg * 2);
+
+    std::remove(path.c_str());
+}
+#endif  // LIQUID_ENABLE_VELOX
+
+// ═══════════════════════════════════════════════════════════════════════
 // No main() — main() is provided by test_velox_crossval.cpp,
 // which initializes Velox MemoryManager and Arrow compute.
 // ═══════════════════════════════════════════════════════════════════════
